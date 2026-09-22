@@ -85,7 +85,7 @@ def cross_utterance_pairs(spk2utts, max_pairs_per_speaker=None):
     Pair each utterance (reference) with the next utterance of the same speaker (target), circularly.
     Returns
         metainfo: [(pair_id, ref_text, ref_wav, " " + tgt_text, tgt_wav)], the format of get_inference_prompt()
-        metadata: {pair_id: {"speaker", "group", "ref_audio", "tgt_text"}}, saved next to the generated wavs
+        metadata: {pair_id: {"speaker", "group", "ref_audio", "tgt_audio", "tgt_text"}}, saved next to the generated wavs
     """
     metainfo, metadata = [], {}
     for spk, utts in spk2utts.items():
@@ -97,7 +97,9 @@ def cross_utterance_pairs(spk2utts, max_pairs_per_speaker=None):
             tgt = utts[(i + 1) % len(utts)]
             pair_id = f"{ref['id']}__to__{tgt['id']}"
             metainfo.append((pair_id, ref["text"], ref["audio"], " " + tgt["text"], tgt["audio"]))
-            metadata[pair_id] = dict(speaker=spk, group=ref["group"], ref_audio=ref["audio"], tgt_text=tgt["text"])
+            metadata[pair_id] = dict(
+                speaker=spk, group=ref["group"], ref_audio=ref["audio"], tgt_audio=tgt["audio"], tgt_text=tgt["text"]
+            )
     return metainfo, metadata
 
 
