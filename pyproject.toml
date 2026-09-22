@@ -3,9 +3,9 @@ requires = ["setuptools >= 61.0", "setuptools-scm>=8.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "f5-tts"
-version = "1.1.15"
-description = "F5-TTS: A Fairytaler that Fakes Fluent and Faithful Speech with Flow Matching"
+name = "rtfree-f5"
+version = "1.0.0"
+description = "RTFree-F5: Transcript-Free Flow-Matching Text-to-Speech via Speech Feature Conditioning (built on F5-TTS)"
 readme = "README.md"
 license = {text = "MIT License"}
 classifiers = [
@@ -47,16 +47,17 @@ dependencies = [
 
 [project.optional-dependencies]
 eval = [
-    "faster_whisper==0.10.1",
     "funasr",
     "jiwer",
     "modelscope",
+    "s3prl",
     "zhconv",
     "zhon",
 ]
 
 [project.urls]
-Homepage = "https://github.com/SWivid/F5-TTS"
+Homepage = "https://github.com/EomSooHwan/RTFree-F5"
+Paper = "https://arxiv.org/abs/2606.20266"
 
 [project.scripts]
 "f5-tts_infer-cli" = "f5_tts.infer.infer_cli:main"

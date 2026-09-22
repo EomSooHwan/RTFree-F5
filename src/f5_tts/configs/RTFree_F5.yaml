@@ -1,24 +1,28 @@
+# RTFree-F5: F5TTS_v1_Base backbone conditioned on projected WavLM features instead of the reference transcript.
+# Used by inference / evaluation scripts to build the model. Training goes through src/f5_tts/train/finetune_cli.py
+# (--exp_name RTFree_F5 --stage {1,2}), see README.
+
 hydra:
   run:
     dir: ckpts/${model.name}_${model.mel_spec.mel_spec_type}_${model.tokenizer}_${datasets.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
 
 datasets:
-  name: LibriTTS_100_360_500_pinyin  # dataset name
-  batch_size_per_gpu: 38400  # 8 GPUs, 8 * 38400 = 307200
+  name: Emilia_ZH_EN  # vocab of the pretrained F5TTS_v1_Base checkpoint (data/Emilia_ZH_EN_pinyin/vocab.txt)
+  batch_size_per_gpu: 38400
   batch_size_type: frame  # frame | sample
-  max_samples: 64  # max sequences per batch if use frame-wise batch_size. we set 32 for small models, 64 for base models
+  max_samples: 64
   num_workers: 16
 
 optim:
-  epochs: LibriTTS_100_360_500_pinyin
+  epochs: 11
   learning_rate: 7.5e-5
-  num_warmup_updates: 20000  # warmup updates
-  grad_accumulation_steps: 1  # note: updates = steps / grad_accumulation_steps
-  max_grad_norm: 1.0  # gradient clipping
-  bnb_optimizer: False  # use bnb 8bit AdamW optimizer or not
+  num_warmup_updates: 20000
+  grad_accumulation_steps: 1
+  max_grad_norm: 1.0
+  bnb_optimizer: False
 
 model:
-  name: F5TTS_v1_Base  # model name
+  name: RTFree_F5  # model name
   tokenizer: pinyin  # tokenizer type
   tokenizer_path: null  # if 'custom' tokenizer, define the path want to use (should be vocab.txt)
   backbone: DiT
@@ -35,6 +39,8 @@ model:
     attn_backend: torch  # torch | flash_attn
     attn_mask_enabled: False
     checkpoint_activations: False  # recompute activations and save memory for extra compute
+  speech_encoder: microsoft/wavlm-large  # frozen SSL encoder, 50 Hz x 1024-d
+  projector_hidden_dim: 512  # 2-layer MLP + LayerNorm, 1024 -> 512 -> 512 (text_dim)
   mel_spec:
     target_sample_rate: 24000
     n_mel_channels: 100

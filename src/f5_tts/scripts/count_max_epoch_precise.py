@@ -5,12 +5,12 @@ from torch.utils.data import SequentialSampler
 from f5_tts.model.dataset import DynamicBatchSampler, load_dataset
 
 
-train_dataset = load_dataset("LibriTTS_100_360_500_pinyin", "pinyin")
+train_dataset = load_dataset("Emilia_ZH_EN", "pinyin")
 sampler = SequentialSampler(train_dataset)
 
-gpus = 4
-batch_size_per_gpu = 16200
-max_samples_per_gpu = 32
+gpus = 8
+batch_size_per_gpu = 38400
+max_samples_per_gpu = 64
 max_updates = 1250000
 
 batch_sampler = DynamicBatchSampler(

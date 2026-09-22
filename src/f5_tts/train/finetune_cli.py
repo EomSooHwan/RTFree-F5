@@ -27,19 +27,19 @@ def parse_args():
         "--exp_name",
         type=str,
         default="F5TTS_v1_Base",
-        choices=["F5TTS_v1_Base", "F5TTS_Base", "E2TTS_Base"],
+        choices=["F5TTS_v1_Base", "F5TTS_Base", "E2TTS_Base", "RTFree_F5"],
         help="Experiment name",
     )
-    parser.add_argument("--dataset_name", type=str, default="LibriTTS_100_360_500", help="Name of the dataset to use")
+    parser.add_argument("--dataset_name", type=str, default="Emilia_ZH_EN", help="Name of the dataset to use")
     parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate for training")
-    parser.add_argument("--batch_size_per_gpu", type=int, default=800, help="Batch size per GPU")
+    parser.add_argument("--batch_size_per_gpu", type=int, default=3200, help="Batch size per GPU")
     parser.add_argument(
         "--batch_size_type", type=str, default="frame", choices=["frame", "sample"], help="Batch size type"
     )
     parser.add_argument("--max_samples", type=int, default=64, help="Max sequences per batch")
     parser.add_argument("--grad_accumulation_steps", type=int, default=1, help="Gradient accumulation steps")
     parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Max gradient norm for clipping")
-    parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs")
+    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--num_warmup_updates", type=int, default=20000, help="Warmup updates")
     parser.add_argument("--save_per_updates", type=int, default=50000, help="Save checkpoint every N updates")
     parser.add_argument(
@@ -50,7 +50,7 @@ def parse_args():
     )
     parser.add_argument("--last_per_updates", type=int, default=5000, help="Save last checkpoint every N updates")
     parser.add_argument("--finetune", action="store_true", help="Use Finetune")
-    parser.add_argument("--pretrain", type=str, default="/data2/esyoon_hdd/soohwan/interspeech26/F5-TTS/ckpts/LibriTTS_100_360_500/reffree_stage_1_fixed/model_last.pt", help="the path to the checkpoint")
+    parser.add_argument("--pretrain", type=str, default=None, help="the path to the checkpoint")
     parser.add_argument(
         "--tokenizer", type=str, default="pinyin", choices=["pinyin", "char", "custom"], help="Tokenizer type"
     )
@@ -65,17 +65,27 @@ def parse_args():
         action="store_true",
         help="Log inferenced samples per ckpt save updates",
     )
-    parser.add_argument("--logger", type=str, default="wandb", choices=[None, "wandb", "tensorboard"], help="logger")
+    parser.add_argument("--logger", type=str, default=None, choices=[None, "wandb", "tensorboard"], help="logger")
     parser.add_argument(
         "--bnb_optimizer",
         action="store_true",
         help="Use 8-bit Adam optimizer from bitsandbytes",
     )
-    parser.add_argument("--stage", type=int, choices=[1, 2], default=None)
-    parser.add_argument("--speech_encoder", type=str, default="microsoft/wavlm-large")
-    parser.add_argument("--run_name", type=str, default=None)
-    parser.add_argument("--lr_projector", type=float, default=None,
-                    help="Learning rate for projector. If None, uses --learning_rate")
+    parser.add_argument(
+        "--run_name", type=str, default=None, help="Subdirectory of ckpts/<dataset_name> and W&B run name"
+    )
+
+    # RTFree-F5 (--exp_name RTFree_F5)
+    parser.add_argument(
+        "--stage", type=int, choices=[1, 2], default=None, help="1: train projector only, 2: projector + DiT"
+    )
+    parser.add_argument(
+        "--lr_projector", type=float, default=None, help="Projector learning rate, default --learning_rate"
+    )
+    parser.add_argument(
+        "--speech_encoder", type=str, default="microsoft/wavlm-large", help="HF name of the WavLM encoder"
+    )
+    parser.add_argument("--projector_hidden_dim", type=int, default=512, help="Projector MLP hidden size")
 
     return parser.parse_args()
 
@@ -92,7 +102,8 @@ def main():
 
     # Model parameters based on experiment name
 
-    if args.exp_name == "F5TTS_v1_Base":
+    rtfree_kwargs = dict()
+    if args.exp_name in ["F5TTS_v1_Base", "RTFree_F5"]:
         wandb_resume_id = None
         model_cls = DiT
         model_cfg = dict(
@@ -108,6 +119,12 @@ def main():
                 ckpt_path = str(cached_path("hf://SWivid/F5-TTS/F5TTS_v1_Base/model_1250000.safetensors"))
             else:
                 ckpt_path = args.pretrain
+        if args.exp_name == "RTFree_F5":  # F5TTS_v1_Base backbone + frozen WavLM + projector, trained in two stages
+            assert args.stage is not None, "RTFree_F5 requires --stage 1 or --stage 2"
+            assert args.finetune, "RTFree_F5 fine-tunes a pretrained F5-TTS checkpoint, pass --finetune"
+            rtfree_kwargs = dict(
+                speech_encoder_name=args.speech_encoder, projector_hidden_dim=args.projector_hidden_dim
+            )
 
     elif args.exp_name == "F5TTS_Base":
         wandb_resume_id = None
@@ -185,7 +202,7 @@ def main():
         transformer=model_cls(**model_cfg, text_num_embeds=vocab_size, mel_dim=n_mel_channels),
         mel_spec_kwargs=mel_spec_kwargs,
         vocab_char_map=vocab_char_map,
-        speech_encoder_name=args.speech_encoder if args.stage else None,
+        **rtfree_kwargs,
     )
 
     trainer = Trainer(
@@ -212,7 +229,9 @@ def main():
         lr_projector=args.lr_projector,
     )
 
-    train_dataset = load_dataset(args.dataset_name, tokenizer, mel_spec_kwargs=mel_spec_kwargs, cross_utterance=(args.stage is not None),)
+    train_dataset = load_dataset(
+        args.dataset_name, tokenizer, mel_spec_kwargs=mel_spec_kwargs, cross_utterance=args.exp_name == "RTFree_F5"
+    )
 
     trainer.train(
         train_dataset,

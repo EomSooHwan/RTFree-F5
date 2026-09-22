@@ -3,7 +3,6 @@
 # From https://github.com/microsoft/UniSpeech/blob/main/downstreams/speaker_verification/models/
 # part of the code is borrowed from https://github.com/lawlict/ECAPA-TDNN
 
-import os
 
 import torch
 import torch.nn as nn

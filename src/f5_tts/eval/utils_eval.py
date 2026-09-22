@@ -86,6 +86,7 @@ def get_inference_prompt(
     num_buckets=200,
     min_secs=3,
     max_secs=40,
+    target_text_only=False,  # RTFree-F5: condition on the target text only (prompt_text is still used for duration)
 ):
     prompts_all = []
 
@@ -120,7 +121,7 @@ def get_inference_prompt(
         # Text
         if len(prompt_text[-1].encode("utf-8")) == 1:
             prompt_text = prompt_text + " "
-        text = [prompt_text + gt_text]
+        text = [gt_text] if target_text_only else [prompt_text + gt_text]
         if tokenizer == "pinyin":
             text_list = convert_char_to_pinyin(text, polyphone=polyphone)
         else:
@@ -149,8 +150,10 @@ def get_inference_prompt(
 
         # deal with batch
         assert infer_batch_size > 0, "infer_batch_size should be greater than 0."
-        if not (min_tokens <= total_mel_len <= max_tokens):
-            print(f"Skipping {utt}: duration {total_mel_len * hop_length // target_sample_rate}s out of range [{min_secs}, {max_secs}]")
+        if not (min_tokens <= total_mel_len <= max_tokens):  # can happen for the atypical-speech testsets
+            print(
+                f"Skipping {utt}: {total_mel_len * hop_length / target_sample_rate:.1f}s out of [{min_secs}, {max_secs}]s"
+            )
             continue
         bucket_i = math.floor((total_mel_len - min_tokens) / (max_tokens - min_tokens + 1) * num_buckets)
 
@@ -278,6 +281,44 @@ def get_librispeech_test(metalst, gen_wav_dir, gpus, librispeech_test_clean_path
     return test_set
 
 
+# ASR transcripts for the reference audios (F5-TTS "ASR" baseline: Whisper large-v3 replaces the oracle transcript)
+
+
+def precompute_asr_transcripts(metainfo, cache_path, accelerator, device="cuda"):
+    """Transcribe every prompt_wav in metainfo (main process only), cache to json, return {prompt_wav: transcript}."""
+    import json
+
+    if not os.path.exists(cache_path) and accelerator.is_main_process:
+        from transformers import WhisperForConditionalGeneration, WhisperProcessor
+
+        processor = WhisperProcessor.from_pretrained("openai/whisper-large-v3")
+        whisper = WhisperForConditionalGeneration.from_pretrained("openai/whisper-large-v3", torch_dtype=torch.float16)
+        whisper = whisper.to(device).eval()
+
+        transcripts = {}
+        for prompt_wav in tqdm(sorted({item[2] for item in metainfo}), desc="ASR transcription of references"):
+            audio, sr = torchaudio.load(prompt_wav)
+            audio = audio.mean(0) if audio.shape[0] > 1 else audio[0]
+            if sr != 16000:
+                audio = torchaudio.functional.resample(audio, sr, 16000)
+            features = processor(audio.numpy(), sampling_rate=16000, return_tensors="pt").input_features
+            with torch.no_grad():
+                ids = whisper.generate(
+                    features.to(device=device, dtype=torch.float16), language="en", task="transcribe"
+                )
+            transcripts[prompt_wav] = processor.batch_decode(ids, skip_special_tokens=True)[0].strip()
+
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        with open(cache_path, "w") as f:
+            json.dump(transcripts, f, indent=2, ensure_ascii=False)
+        del whisper, processor
+        torch.cuda.empty_cache()
+
+    accelerator.wait_for_everyone()
+    with open(cache_path) as f:
+        return json.load(f)
+
+
 # load asr model
 
 
@@ -293,7 +334,7 @@ def load_asr_model(lang, ckpt_dir=""):
             disable_update=True,
         )  # following seed-tts setting
     elif lang == "en":
-        from transformers import WhisperProcessor, WhisperForConditionalGeneration
+        from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
         model_name = "openai/whisper-large-v3" if ckpt_dir == "" else ckpt_dir
         processor = WhisperProcessor.from_pretrained(model_name)
@@ -317,9 +358,7 @@ def run_asr_wer(args):
     elif lang == "en":
         torch.cuda.set_device(rank)
     else:
-        raise NotImplementedError(
-            "lang support only 'zh' (funasr paraformer-zh), 'en' (HF whisper-large-v3), for now."
-        )
+        raise NotImplementedError("lang support only 'zh' (funasr paraformer-zh), 'en' (HF whisper-large-v3), for now.")
 
     asr_model = load_asr_model(lang, ckpt_dir=ckpt_dir)
 
@@ -343,9 +382,9 @@ def run_asr_wer(args):
             if sr != 16000:
                 audio = torchaudio.functional.resample(audio, sr, 16000)
             audio = audio.squeeze(0).numpy()
-            input_features = whisper_processor(
-                audio, sampling_rate=16000, return_tensors="pt"
-            ).input_features.to(device=f"cuda:{rank}", dtype=torch.float16)
+            input_features = whisper_processor(audio, sampling_rate=16000, return_tensors="pt").input_features.to(
+                device=f"cuda:{rank}", dtype=torch.float16
+            )
             with torch.no_grad():
                 predicted_ids = whisper_model.generate(
                     input_features,
@@ -385,6 +424,8 @@ def run_asr_wer(args):
                 "truth": raw_truth,
                 "hypo": raw_hypo,
                 "wer": wer,
+                "truth_norm": truth,
+                "hypo_norm": hypo,
             }
         )
 
