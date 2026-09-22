@@ -64,8 +64,8 @@ def load_l2arctic_utterances(data_root, min_duration=0.5, max_duration=30):
             wav_path = os.path.join(wav_dir, wav_file)
             if not text or not (min_duration <= sf.info(wav_path).duration <= max_duration):
                 continue
-            spk2utts[spk].append(
-                dict(id=f"{spk}_{utt}", audio=wav_path, text=text, group=L2ARCTIC_SPEAKER_L1.get(spk, "Unknown"))
+            spk2utts[spk].append(  # pair ids get a "<SPK>_" prefix, see cross_utterance_pairs
+                dict(id=utt, audio=wav_path, text=text, group=L2ARCTIC_SPEAKER_L1.get(spk, "Unknown"), prefix=f"{spk}_")
             )
     return spk2utts
 
@@ -95,7 +95,7 @@ def cross_utterance_pairs(spk2utts, max_pairs_per_speaker=None):
             if max_pairs_per_speaker is not None and i >= max_pairs_per_speaker:
                 break
             tgt = utts[(i + 1) % len(utts)]
-            pair_id = f"{ref['id']}__to__{tgt['id']}"
+            pair_id = f"{ref.get('prefix', '')}{ref['id']}__to__{tgt['id']}"  # SAP: <ref>__to__<tgt>, L2: <SPK>_<ref>__to__<tgt>
             metainfo.append((pair_id, ref["text"], ref["audio"], " " + tgt["text"], tgt["audio"]))
             metadata[pair_id] = dict(
                 speaker=spk, group=ref["group"], ref_audio=ref["audio"], tgt_audio=tgt["audio"], tgt_text=tgt["text"]
