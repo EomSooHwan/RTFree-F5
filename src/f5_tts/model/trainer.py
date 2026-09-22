@@ -53,6 +53,8 @@ class Trainer:
         is_local_vocoder: bool = False,  # use local path vocoder
         local_vocoder_path: str = "",  # local vocoder path
         model_cfg_dict: dict = dict(),  # training config
+        stage=None,
+        lr_projector=None,
     ):
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 
@@ -134,13 +136,46 @@ class Trainer:
 
         self.duration_predictor = duration_predictor
 
-        if bnb_optimizer:
-            import bitsandbytes as bnb
-
-            self.optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=learning_rate)
+        # Build parameter groups with differential learning rates
+        if stage is not None and lr_projector is not None:
+            projector_params = []
+            backbone_params = []
+            
+            for name, param in model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if "projector" in name:
+                    projector_params.append(param)
+                else:
+                    backbone_params.append(param)
+            
+            param_groups = [
+                {"params": backbone_params, "lr": learning_rate},
+                {"params": projector_params, "lr": lr_projector},
+            ]
+            
+            if self.is_main:
+                print(f"\nDifferential LR:")
+                print(f"  Backbone: {learning_rate} ({len(backbone_params)} tensors)")
+                print(f"  Projector: {lr_projector} ({len(projector_params)} tensors)")
+            
+            if bnb_optimizer:
+                import bitsandbytes as bnb
+                self.optimizer = bnb.optim.AdamW8bit(param_groups)
+            else:
+                self.optimizer = AdamW(param_groups)
         else:
-            self.optimizer = AdamW(model.parameters(), lr=learning_rate)
+            # Single LR for all parameters (original behavior)
+            if bnb_optimizer:
+                import bitsandbytes as bnb
+                self.optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=learning_rate)
+            else:
+                self.optimizer = AdamW(model.parameters(), lr=learning_rate)
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
+        
+        self.stage = stage
+        if stage is not None:
+            self.accelerator.unwrap_model(self.model).set_training_stage(stage)
 
     @property
     def is_main(self):
@@ -227,6 +262,43 @@ class Trainer:
             if key in checkpoint["ema_model_state_dict"]:
                 del checkpoint["ema_model_state_dict"][key]
 
+        # === ADD: Partial loading for RefFree training ===
+        if self.stage is not None:
+            ema_state = checkpoint["ema_model_state_dict"]
+            model_state = self.accelerator.unwrap_model(self.model).state_dict()
+            
+            # Filter out incompatible keys (shape mismatch or missing)
+            filtered_state = {}
+            skipped = []
+            for k, v in ema_state.items():
+                clean_k = k.replace("ema_model.", "") if k.startswith("ema_model.") else k
+                if clean_k not in model_state:
+                    skipped.append(f"not in model: {k}")
+                    continue
+                if model_state[clean_k].shape != v.shape:
+                    skipped.append(f"shape mismatch: {k} {list(v.shape)} vs {list(model_state[clean_k].shape)}")
+                    continue
+                filtered_state[clean_k] = v
+            
+            if self.is_main:
+                print(f"\nPartial checkpoint loading for RefFree stage {self.stage}:")
+                print(f"  Loaded: {len(filtered_state)} / {len(model_state)} parameters")
+                if skipped:
+                    print(f"  Skipped {len(skipped)} keys:")
+                    for s in skipped[:8]:
+                        print(f"    {s}")
+                    if len(skipped) > 8:
+                        print(f"    ... and {len(skipped) - 8} more")
+                
+                self.ema_model.load_state_dict(filtered_state, strict=False)
+            
+            self.accelerator.unwrap_model(self.model).load_state_dict(filtered_state, strict=False)
+            
+            del checkpoint
+            gc.collect()
+            return 0  # Start from update 0
+        # === END ADD ===
+
         if self.is_main:
             self.ema_model.load_state_dict(checkpoint["ema_model_state_dict"])
 
@@ -262,6 +334,11 @@ class Trainer:
         return update
 
     def train(self, train_dataset: Dataset, num_workers=16, resumable_with_seed: int = None):
+        
+        from f5_tts.model.dataset import CrossUtteranceDataset, cross_utterance_collate_fn
+        is_cross = isinstance(train_dataset, CrossUtteranceDataset)
+        _collate = cross_utterance_collate_fn if is_cross else collate_fn
+        
         if self.log_samples:
             from f5_tts.infer.utils_infer import cfg_strength, load_vocoder, nfe_step, sway_sampling_coef
 
@@ -281,7 +358,7 @@ class Trainer:
         if self.batch_size_type == "sample":
             train_dataloader = DataLoader(
                 train_dataset,
-                collate_fn=collate_fn,
+                collate_fn=_collate,
                 num_workers=num_workers,
                 pin_memory=True,
                 persistent_workers=True,
@@ -301,7 +378,7 @@ class Trainer:
             )
             train_dataloader = DataLoader(
                 train_dataset,
-                collate_fn=collate_fn,
+                collate_fn=_collate,
                 num_workers=num_workers,
                 pin_memory=True,
                 persistent_workers=True,
@@ -361,18 +438,33 @@ class Trainer:
 
             for batch in current_dataloader:
                 with self.accelerator.accumulate(self.model):
-                    text_inputs = batch["text"]
-                    mel_spec = batch["mel"].permute(0, 2, 1)
-                    mel_lengths = batch["mel_lengths"]
 
                     # TODO. add duration predictor training
                     if self.duration_predictor is not None and self.accelerator.is_local_main_process:
                         dur_loss = self.duration_predictor(mel_spec, lens=batch.get("durations"))
                         self.accelerator.log({"duration loss": dur_loss.item()}, step=global_update)
 
-                    loss, cond, pred = self.model(
-                        mel_spec, text=text_inputs, lens=mel_lengths, noise_scheduler=self.noise_scheduler
-                    )
+                    if is_cross:
+                        full_mel = batch["mel"].permute(0, 2, 1)  # (B, T, D)
+                        full_lens = batch["mel_lengths"]
+                        ref_lens = batch["ref_mel_lengths"]
+                        
+                        loss, cond, pred = self.model(
+                            full_mel,
+                            text=batch["tgt_text"],
+                            lens=full_lens,
+                            ref_audio=batch["ref_audio"],
+                            ref_lens=ref_lens,                       # tensor, not scalar!
+                            ref_audio_lens=batch["ref_audio_lens"],   # NEW
+                            noise_scheduler=self.noise_scheduler,
+                        )
+                    else:
+                        loss, cond, pred = self.model(
+                            batch["mel"].permute(0, 2, 1),
+                            text=batch["text"],
+                            lens=batch["mel_lengths"],
+                            noise_scheduler=self.noise_scheduler
+                        )
                     self.accelerator.backward(loss)
 
                     if self.max_grad_norm > 0 and self.accelerator.sync_gradients:

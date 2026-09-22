@@ -29,6 +29,7 @@ from f5_tts.model.utils import (
     list_str_to_tensor,
     mask_from_frac_lengths,
 )
+from f5_tts.model.speech_encoder import SpeechEncoderWavLM, Projector, align_features
 
 
 class CFM(nn.Module):
@@ -48,6 +49,10 @@ class CFM(nn.Module):
         mel_spec_kwargs: dict = dict(),
         frac_lengths_mask: tuple[float, float] = (0.7, 1.0),
         vocab_char_map: dict[str:int] | None = None,
+        # added by sheom 0206
+        speech_encoder_name=None,
+        projector_hidden_dim=None,
+        audio_sample_rate=24000
     ):
         super().__init__()
 
@@ -75,10 +80,89 @@ class CFM(nn.Module):
 
         # vocab map for tokenization
         self.vocab_char_map = vocab_char_map
+        
+        # added by sheom 0206
+        self.speech_encoder = None
+        self.projector = None
+        self.audio_sample_rate = audio_sample_rate
+        if speech_encoder_name:
+            self.speech_encoder = SpeechEncoderWavLM(speech_encoder_name, freeze=True)
+            text_dim = self.transformer.text_embed.text_embed.embedding_dim
+            self.projector = Projector(
+                self.speech_encoder.output_dim,  # 1024 for wavlm-large
+                text_dim,                         # 512 (matches text_embed)
+                projector_hidden_dim,
+            )
 
     @property
     def device(self):
         return next(self.parameters()).device
+    
+    def set_training_stage(self, stage):
+        """Stage 1: projector only. Stage 2: projector + full DiT."""
+        trainable_params = 0
+        frozen_params = 0
+        
+        for name, p in self.transformer.named_parameters():
+            if stage == 1:
+                p.requires_grad = False  # Freeze ALL transformer params
+            else:  # stage 2
+                p.requires_grad = True
+            
+            if p.requires_grad:
+                trainable_params += p.numel()
+            else:
+                frozen_params += p.numel()
+        
+        # Text encoder always frozen in both stages
+        for p in self.transformer.text_embed.parameters():
+            p.requires_grad = False
+        
+        if self.projector:
+            for p in self.projector.parameters():
+                p.requires_grad = True
+                trainable_params += p.numel()
+        
+        if self.speech_encoder:
+            self.speech_encoder.freeze()
+            for p in self.speech_encoder.parameters():
+                frozen_params += p.numel()
+        
+        print(f"\nTraining stage {stage}:")
+        print(f"  Trainable params: {trainable_params / 1e6:.2f}M")
+        print(f"  Frozen params: {frozen_params / 1e6:.2f}M")
+    
+    def encode_speech(self, audio, ref_lens, ref_audio_lens=None):
+        """
+        Args:
+            audio: (batch, max_audio_samples) — zero-padded ref audio
+            ref_lens: (batch,) — per-sample ref mel frame counts (used for alignment later)
+            ref_audio_lens: (batch,) — per-sample ref audio sample counts (for WavLM mask)
+        Returns:
+            (batch, max_ssl_frames, D) — projected features, still variable-length per sample
+        """
+        if self.speech_encoder is None:
+            return None
+        self.speech_encoder.eval()
+        self.speech_encoder.float()
+        audio = audio.float()
+
+        # Build attention mask for WavLM (1 = real, 0 = padding)
+        attention_mask = None
+        if ref_audio_lens is not None:
+            # ref_audio_lens is at 24kHz, WavLM expects 16kHz
+            wavlm_lens = (ref_audio_lens.float() * self.speech_encoder.target_sample_rate / self.audio_sample_rate).long()
+            max_len = audio.shape[-1]
+            # After resampling inside speech_encoder, the length changes
+            # But attention_mask is applied to the input waveform before WavLM
+            # WavLM's forward handles the mask internally
+            resampled_max = int(max_len * self.speech_encoder.target_sample_rate / self.audio_sample_rate)
+            attention_mask = torch.arange(resampled_max, device=audio.device).unsqueeze(0) < wavlm_lens.unsqueeze(1)
+            attention_mask = attention_mask.long()
+
+        feat = self.speech_encoder(audio, self.audio_sample_rate, attention_mask=attention_mask)
+        feat = self.projector(feat.to(next(self.projector.parameters()).dtype))
+        return feat
 
     @torch.no_grad()
     def sample(
@@ -99,6 +183,8 @@ class CFM(nn.Module):
         duplicate_test=False,
         t_inter=0.1,
         edit_mask=None,
+        ref_audio=None,
+        ref_audio_lens=None
     ):
         self.eval()
         # raw wave
@@ -151,6 +237,16 @@ class CFM(nn.Module):
         step_cond = torch.where(
             cond_mask, cond, torch.zeros_like(cond)
         )  # allow direct control (cut cond audio) with lens passed in
+        
+        if ref_audio is not None:
+            ref_lens = lens.clone()  # lens is already (batch,) tensor = ref_mel_lens
+            ref_audio_lens = torch.tensor(
+                [ref_audio.shape[-1]] * batch, device=device  # works for batch=1; see below for batch>1
+            )
+            speech_cond = self.encode_speech(ref_audio, ref_lens, ref_audio_lens=ref_audio_lens)
+        else:
+            speech_cond = None
+            ref_lens = None
 
         if batch > 1:
             mask = lens_to_mask(duration)
@@ -174,6 +270,8 @@ class CFM(nn.Module):
                     drop_audio_cond=False,
                     drop_text=False,
                     cache=True,
+                    speech_cond=speech_cond,
+                    ref_lens=ref_lens
                 )
                 return pred
 
@@ -186,6 +284,8 @@ class CFM(nn.Module):
                 mask=mask,
                 cfg_infer=True,
                 cache=True,
+                speech_cond=speech_cond,
+                ref_lens=ref_lens
             )
             pred, null_pred = torch.chunk(pred_cfg, 2, dim=0)
             return pred + (pred - null_pred) * cfg_strength
@@ -235,6 +335,9 @@ class CFM(nn.Module):
         *,
         lens: int["b"] | None = None,
         noise_scheduler: str | None = None,
+        ref_audio=None,
+        ref_lens=None,          # (batch,) tensor of per-sample ref mel length
+        ref_audio_lens=None,    # (batch,) tensor of per-sample ref audio sample lengths
     ):
         # handle raw wave
         if inp.ndim == 2:
@@ -258,11 +361,28 @@ class CFM(nn.Module):
         mask = lens_to_mask(lens, length=seq_len)
 
         # get a random span to mask out for training conditionally
-        frac_lengths = torch.zeros((batch,), device=self.device).float().uniform_(*self.frac_lengths_mask)
-        rand_span_mask = mask_from_frac_lengths(lens, frac_lengths)
+        if ref_lens is not None:
+            # Cross-utterance: unmask ref, mask tgt
+            rand_span_mask = torch.zeros((batch, seq_len), dtype=torch.bool, device=device)
+            for i in range(batch):
+                rl = ref_lens[i].item()
+                rl = min(rl, seq_len)
+                rand_span_mask[i, rl:] = True   # mask target portion
+            if exists(mask):
+                rand_span_mask &= mask
+        else:
+            # Original F5-TTS random masking
+            frac_lengths = torch.zeros((batch,), device=self.device).float().uniform_(*self.frac_lengths_mask)
+            rand_span_mask = mask_from_frac_lengths(lens, frac_lengths)
 
-        if exists(mask):
-            rand_span_mask &= mask
+            if rand_span_mask.shape[1] != seq_len:
+                if rand_span_mask.shape[1] < seq_len:
+                    rand_span_mask = F.pad(rand_span_mask, (0, seq_len - rand_span_mask.shape[1]), value=False)
+                else:
+                    rand_span_mask = rand_span_mask[:, :seq_len]
+
+            if exists(mask):
+                rand_span_mask &= mask
 
         # mel is x1
         x1 = inp
@@ -289,10 +409,20 @@ class CFM(nn.Module):
             drop_text = True
         else:
             drop_text = False
+            
+        if ref_audio is not None and ref_lens is not None:
+            speech_cond = self.encode_speech(
+                ref_audio,
+                ref_lens,
+                ref_audio_lens=ref_audio_lens,
+            )
+        else:
+            speech_cond = None
 
         # apply mask will use more memory; might adjust batchsize or batchsampler long sequence threshold
         pred = self.transformer(
-            x=φ, cond=cond, text=text, time=time, drop_audio_cond=drop_audio_cond, drop_text=drop_text, mask=mask
+            x=φ, cond=cond, text=text, time=time, drop_audio_cond=drop_audio_cond, drop_text=drop_text, mask=mask,
+            speech_cond=speech_cond, ref_lens=ref_lens
         )
 
         # flow matching loss

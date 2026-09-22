@@ -30,16 +30,16 @@ def parse_args():
         choices=["F5TTS_v1_Base", "F5TTS_Base", "E2TTS_Base"],
         help="Experiment name",
     )
-    parser.add_argument("--dataset_name", type=str, default="Emilia_ZH_EN", help="Name of the dataset to use")
+    parser.add_argument("--dataset_name", type=str, default="LibriTTS_100_360_500", help="Name of the dataset to use")
     parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate for training")
-    parser.add_argument("--batch_size_per_gpu", type=int, default=3200, help="Batch size per GPU")
+    parser.add_argument("--batch_size_per_gpu", type=int, default=800, help="Batch size per GPU")
     parser.add_argument(
         "--batch_size_type", type=str, default="frame", choices=["frame", "sample"], help="Batch size type"
     )
     parser.add_argument("--max_samples", type=int, default=64, help="Max sequences per batch")
     parser.add_argument("--grad_accumulation_steps", type=int, default=1, help="Gradient accumulation steps")
     parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Max gradient norm for clipping")
-    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
+    parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs")
     parser.add_argument("--num_warmup_updates", type=int, default=20000, help="Warmup updates")
     parser.add_argument("--save_per_updates", type=int, default=50000, help="Save checkpoint every N updates")
     parser.add_argument(
@@ -50,7 +50,7 @@ def parse_args():
     )
     parser.add_argument("--last_per_updates", type=int, default=5000, help="Save last checkpoint every N updates")
     parser.add_argument("--finetune", action="store_true", help="Use Finetune")
-    parser.add_argument("--pretrain", type=str, default=None, help="the path to the checkpoint")
+    parser.add_argument("--pretrain", type=str, default="/data2/esyoon_hdd/soohwan/interspeech26/F5-TTS/ckpts/LibriTTS_100_360_500/reffree_stage_1_fixed/model_last.pt", help="the path to the checkpoint")
     parser.add_argument(
         "--tokenizer", type=str, default="pinyin", choices=["pinyin", "char", "custom"], help="Tokenizer type"
     )
@@ -65,12 +65,17 @@ def parse_args():
         action="store_true",
         help="Log inferenced samples per ckpt save updates",
     )
-    parser.add_argument("--logger", type=str, default=None, choices=[None, "wandb", "tensorboard"], help="logger")
+    parser.add_argument("--logger", type=str, default="wandb", choices=[None, "wandb", "tensorboard"], help="logger")
     parser.add_argument(
         "--bnb_optimizer",
         action="store_true",
         help="Use 8-bit Adam optimizer from bitsandbytes",
     )
+    parser.add_argument("--stage", type=int, choices=[1, 2], default=None)
+    parser.add_argument("--speech_encoder", type=str, default="microsoft/wavlm-large")
+    parser.add_argument("--run_name", type=str, default=None)
+    parser.add_argument("--lr_projector", type=float, default=None,
+                    help="Learning rate for projector. If None, uses --learning_rate")
 
     return parser.parse_args()
 
@@ -82,6 +87,8 @@ def main():
     args = parse_args()
 
     checkpoint_path = str(files("f5_tts").joinpath(f"../../ckpts/{args.dataset_name}"))
+    if args.run_name:
+        checkpoint_path = os.path.join(checkpoint_path, args.run_name)
 
     # Model parameters based on experiment name
 
@@ -178,6 +185,7 @@ def main():
         transformer=model_cls(**model_cfg, text_num_embeds=vocab_size, mel_dim=n_mel_channels),
         mel_spec_kwargs=mel_spec_kwargs,
         vocab_char_map=vocab_char_map,
+        speech_encoder_name=args.speech_encoder if args.stage else None,
     )
 
     trainer = Trainer(
@@ -195,14 +203,16 @@ def main():
         max_grad_norm=args.max_grad_norm,
         logger=args.logger,
         wandb_project=args.dataset_name,
-        wandb_run_name=args.exp_name,
+        wandb_run_name=args.run_name if args.run_name else args.exp_name,
         wandb_resume_id=wandb_resume_id,
         log_samples=args.log_samples,
         last_per_updates=args.last_per_updates,
         bnb_optimizer=args.bnb_optimizer,
+        stage=args.stage,
+        lr_projector=args.lr_projector,
     )
 
-    train_dataset = load_dataset(args.dataset_name, tokenizer, mel_spec_kwargs=mel_spec_kwargs)
+    train_dataset = load_dataset(args.dataset_name, tokenizer, mel_spec_kwargs=mel_spec_kwargs, cross_utterance=(args.stage is not None),)
 
     trainer.train(
         train_dataset,

@@ -131,9 +131,47 @@ class InputEmbedding(nn.Module):
         text_embed: float["b n d"],
         drop_audio_cond=False,
         audio_mask: bool["b n"] | None = None,
+        speech_cond=None,
+        ref_lens=None,  # (batch,) tensor, not scalar
     ):
-        if drop_audio_cond:  # cfg for cond audio
+        if drop_audio_cond:
             cond = torch.zeros_like(cond)
+        batch, seq_len, _ = x.shape
+
+        if speech_cond is not None and ref_lens is not None:
+            # Build conditioning per-sample because each has different ref_len
+            combined_list = []
+            for i in range(batch):
+                rl = min(ref_lens[i].item(), seq_len - 1)
+                rl = int(rl)
+
+                # Align this sample's speech_cond to its ref_len
+                sc_i = speech_cond[i:i+1]  # (1, T_ssl, D)
+                if sc_i.shape[1] != rl:
+                    sc_i = F.interpolate(
+                        sc_i.transpose(1, 2), size=rl, mode='linear', align_corners=False
+                    ).transpose(1, 2)  # (1, rl, D)
+
+                tgt_len = seq_len - rl
+                te_i = text_embed[i:i+1, :tgt_len, :]  # (1, tgt_len, D)
+
+                combined_i = torch.cat([sc_i, te_i], dim=1)  # (1, rl+tgt_len, D)
+
+                # Pad or truncate to seq_len
+                if combined_i.shape[1] < seq_len:
+                    combined_i = F.pad(combined_i, (0, 0, 0, seq_len - combined_i.shape[1]))
+                else:
+                    combined_i = combined_i[:, :seq_len, :]
+
+                combined_list.append(combined_i)
+
+            text_embed = torch.cat(combined_list, dim=0)  # (batch, seq_len, D)
+        else:
+            # Original path — no speech conditioning
+            if text_embed.shape[1] < seq_len:
+                text_embed = F.pad(text_embed, (0, 0, 0, seq_len - text_embed.shape[1]))
+            elif text_embed.shape[1] > seq_len:
+                text_embed = text_embed[:, :seq_len, :]
 
         x = self.proj(torch.cat((x, cond, text_embed), dim=-1))
         x = self.conv_pos_embed(x, mask=audio_mask) + x
@@ -240,6 +278,9 @@ class DiT(nn.Module):
         drop_text: bool = False,
         cache: bool = True,
         audio_mask: bool["b n"] | None = None,
+        # added by sheom 0206
+        speech_cond=None,
+        ref_lens=None,
     ):
         if self.text_uncond is None or self.text_cond is None or not cache:
             if audio_mask is None:
@@ -268,7 +309,8 @@ class DiT(nn.Module):
             else:
                 text_embed = self.text_cond
 
-        x = self.input_embed(x, cond, text_embed, drop_audio_cond=drop_audio_cond, audio_mask=audio_mask)
+        x = self.input_embed(x, cond, text_embed, drop_audio_cond=drop_audio_cond, audio_mask=audio_mask,
+                             speech_cond=speech_cond, ref_lens=ref_lens)
 
         return x
 
@@ -286,6 +328,9 @@ class DiT(nn.Module):
         drop_text: bool = False,  # cfg for text
         cfg_infer: bool = False,  # cfg inference, pack cond & uncond forward
         cache: bool = False,
+        # added by sheom 0206
+        speech_cond=None,
+        ref_lens=None,
     ):
         batch, seq_len = x.shape[0], x.shape[1]
         if time.ndim == 0:
@@ -295,17 +340,20 @@ class DiT(nn.Module):
         t = self.time_embed(time)
         if cfg_infer:  # pack cond & uncond forward: b n d -> 2b n d
             x_cond = self.get_input_embed(
-                x, cond, text, drop_audio_cond=False, drop_text=False, cache=cache, audio_mask=mask
+                x, cond, text, drop_audio_cond=False, drop_text=False, cache=cache, audio_mask=mask,
+                speech_cond=speech_cond, ref_lens=ref_lens
             )
             x_uncond = self.get_input_embed(
-                x, cond, text, drop_audio_cond=True, drop_text=True, cache=cache, audio_mask=mask
+                x, cond, text, drop_audio_cond=True, drop_text=True, cache=cache, audio_mask=mask,
+                speech_cond=None, ref_lens=ref_lens
             )
             x = torch.cat((x_cond, x_uncond), dim=0)
             t = torch.cat((t, t), dim=0)
             mask = torch.cat((mask, mask), dim=0) if mask is not None else None
         else:
             x = self.get_input_embed(
-                x, cond, text, drop_audio_cond=drop_audio_cond, drop_text=drop_text, cache=cache, audio_mask=mask
+                x, cond, text, drop_audio_cond=drop_audio_cond, drop_text=drop_text, cache=cache, audio_mask=mask,
+                speech_cond=speech_cond, ref_lens=ref_lens
             )
 
         rope = self.rotary_embed.forward_from_seq_len(seq_len)

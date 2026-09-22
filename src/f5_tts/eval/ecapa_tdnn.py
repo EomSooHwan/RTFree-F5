@@ -181,12 +181,11 @@ class ECAPA_TDNN(nn.Module):
         self.update_extract = update_extract
         self.sr = sr
 
-        torch.hub._validate_not_a_forked_repo = lambda a, b, c: True
-        try:
-            local_s3prl_path = os.path.expanduser("~/.cache/torch/hub/s3prl_s3prl_main")
-            self.feature_extract = torch.hub.load(local_s3prl_path, feat_type, source="local", config_path=config_path)
-        except:  # noqa: E722
-            self.feature_extract = torch.hub.load("s3prl/s3prl", feat_type)
+        import importlib
+
+        s3prl_hub = importlib.import_module("s3prl.hub")
+        model_fn = getattr(s3prl_hub, feat_type)
+        self.feature_extract = model_fn(config_path=config_path)
 
         if len(self.feature_extract.model.encoder.layers) == 24 and hasattr(
             self.feature_extract.model.encoder.layers[23].self_attn, "fp32_attention"

@@ -218,11 +218,55 @@ def load_checkpoint(model, ckpt_path, device: str, dtype=None, use_ema=True):
             if key in checkpoint["model_state_dict"]:
                 del checkpoint["model_state_dict"][key]
 
-        model.load_state_dict(checkpoint["model_state_dict"])
+        # === PARTIAL LOADING (for RefFree compatibility) ===
+        model_state = model.state_dict()
+        ckpt_state = checkpoint["model_state_dict"]
+        
+        # Filter: only load keys that exist in model AND have matching shapes
+        filtered_state = {}
+        missing_keys = []
+        shape_mismatch_keys = []
+        
+        for k, v in ckpt_state.items():
+            if k in model_state:
+                if model_state[k].shape == v.shape:
+                    filtered_state[k] = v
+                else:
+                    shape_mismatch_keys.append(k)
+            # else: key in ckpt but not in model (ignore)
+        
+        # Find keys in model but not in ckpt (will use initialized values)
+        for k in model_state.keys():
+            if k not in ckpt_state:
+                missing_keys.append(k)
+        
+        # Log partial loading info
+        if missing_keys:
+            print(f"[load_checkpoint] Keys in model but not in checkpoint (using initialized): {len(missing_keys)}")
+            for k in missing_keys[:10]:  # Show first 10
+                print(f"  - {k}")
+            if len(missing_keys) > 10:
+                print(f"  ... and {len(missing_keys) - 10} more")
+        
+        if shape_mismatch_keys:
+            print(f"[load_checkpoint] Shape mismatch keys (using initialized): {shape_mismatch_keys}")
+        
+        model.load_state_dict(filtered_state, strict=False)
+        print(f"[load_checkpoint] Loaded {len(filtered_state)}/{len(model_state)} parameters")
+        # === END PARTIAL LOADING ===
+        
     else:
         if ckpt_type == "safetensors":
             checkpoint = {"model_state_dict": checkpoint}
-        model.load_state_dict(checkpoint["model_state_dict"])
+        
+        # === PARTIAL LOADING for non-EMA too ===
+        model_state = model.state_dict()
+        ckpt_state = checkpoint["model_state_dict"]
+        filtered_state = {k: v for k, v in ckpt_state.items() 
+                         if k in model_state and model_state[k].shape == v.shape}
+        model.load_state_dict(filtered_state, strict=False)
+        print(f"[load_checkpoint] Loaded {len(filtered_state)}/{len(model_state)} parameters")
+        # === END PARTIAL LOADING ===
 
     del checkpoint
     torch.cuda.empty_cache()
@@ -242,6 +286,7 @@ def load_model(
     ode_method=ode_method,
     use_ema=True,
     device=device,
+    speech_encoder_name=None,
 ):
     if vocab_file == "":
         vocab_file = str(files("f5_tts").joinpath("infer/examples/vocab.txt"))
@@ -266,6 +311,7 @@ def load_model(
             method=ode_method,
         ),
         vocab_char_map=vocab_char_map,
+        speech_encoder_name=speech_encoder_name,
     ).to(device)
 
     dtype = torch.float32 if mel_spec_type == "bigvgan" else None
@@ -396,6 +442,7 @@ def infer_process(
     speed=speed,
     fix_duration=fix_duration,
     device=device,
+    reffree=False,
 ):
     # Split the input text into batches
     audio, sr = torchaudio.load(ref_audio)
@@ -423,6 +470,7 @@ def infer_process(
             speed=speed,
             fix_duration=fix_duration,
             device=device,
+            reffree=reffree,
         )
     )
 
@@ -448,6 +496,7 @@ def infer_batch_process(
     device=None,
     streaming=False,
     chunk_size=2048,
+    reffree=False,
 ):
     audio, sr = ref_audio
     if audio.shape[0] > 1:
@@ -484,6 +533,15 @@ def infer_batch_process(
             ref_text_len = len(ref_text.encode("utf-8"))
             gen_text_len = len(gen_text.encode("utf-8"))
             duration = ref_audio_len + int(ref_audio_len / ref_text_len * gen_text_len / local_speed)
+            
+        ref_audio_tensor = None
+        if reffree:
+            ref_audio_tensor = audio.clone()
+            if ref_audio_tensor.shape[0] > 1:
+                ref_audio_tensor = ref_audio_tensor.mean(0, keepdim=True)
+            if sr != target_sample_rate:
+                ref_audio_tensor = torchaudio.functional.resample(ref_audio_tensor, sr, target_sample_rate)
+            ref_audio_tensor = ref_audio_tensor.to(device)
 
         # inference
         with torch.inference_mode():
@@ -494,6 +552,7 @@ def infer_batch_process(
                 steps=nfe_step,
                 cfg_strength=cfg_strength,
                 sway_sampling_coef=sway_sampling_coef,
+                ref_audio=ref_audio_tensor
             )
             del _
 

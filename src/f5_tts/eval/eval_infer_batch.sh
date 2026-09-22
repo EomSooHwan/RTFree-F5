@@ -3,13 +3,31 @@ set -e
 export PYTHONWARNINGS="ignore::UserWarning,ignore::FutureWarning"
 
 # Configuration parameters
-MODEL_NAME="F5TTS_v1_Base"
+MODEL_NAME="LibriTTS_100_360_500"
+CONFIG_NAME="F5TTS_v1_Base"  # Config to load (can differ from MODEL_NAME)
 SEEDS=(0 1 2)
-CKPTSTEPS=(1250000)
-TASKS=("seedtts_test_zh" "seedtts_test_en" "ls_pc_test_clean")
+TASKS=("seedtts_test_en" "ls_pc_test_clean")
+# TASKS=("sap_dev")
 LS_TEST_CLEAN_PATH="data/LibriSpeech/test-clean"
-GPUS="[0,1,2,3,4,5,6,7]"
+GPUS="[0,1,2,3]"
 OFFLINE_MODE=false
+REFFREE=false
+
+# Reference text modes to evaluate
+# "reffree" uses speech encoder; "oracle" and "asr" are F5-TTS baselines
+if [ "$REFFREE" = true ]; then
+    MODES=("reffree")
+else
+    MODES=("asr")
+fi
+# Uncomment to run all three for comparison:
+# MODES=("reffree" "oracle" "asr")
+
+# Checkpoint specification: use ONE of these two approaches
+# Approach 1: Explicit checkpoint path (takes priority)
+CKPT_PATH="/data2/esyoon_hdd/soohwan/interspeech26/F5-TTS/ckpts/F5-TTS/F5TTS_v1_Base/model_1250000.safetensors"
+# Approach 2: Step numbers (used only if CKPT_PATH is empty)
+CKPTSTEPS=(300000)
 
 # Parse arguments
 if [ $OFFLINE_MODE = true ]; then
@@ -40,13 +58,14 @@ fi
 
 # Function: Execute eval tasks
 execute_eval_tasks() {
-    local ckptstep=$1
+    local ckpt_label=$1
     local seed=$2
     local task_name=$3
+    local mode=$4
     
-    local gen_wav_dir="results/${MODEL_NAME}_${ckptstep}/${task_name}/seed${seed}_euler_nfe32_vocos_ss-1_cfg2.0_speed1.0"
-    
-    echo ">>>>>>>> Starting eval task: ckptstep=${ckptstep}, seed=${seed}, task=${task_name}"
+    local gen_wav_dir="results/${MODEL_NAME}_${ckpt_label}/${task_name}_${mode}/seed${seed}_euler_nfe32_vocos_ss-1_cfg2.0_speed1.0"
+
+    echo ">>>>>>>> Starting eval task: ckpt=${ckpt_label}, seed=${seed}, task=${task_name}, mode=${mode}"
     
     case $task_name in
         "seedtts_test_zh")
@@ -66,12 +85,37 @@ execute_eval_tasks() {
             ;;
     esac
     
-    echo ">>>>>>>> Completed eval task: ckptstep=${ckptstep}, seed=${seed}, task=${task_name}"
+    echo ">>>>>>>> Completed eval task: ckpt=${ckpt_label}, seed=${seed}, task=${task_name}"
 }
 
+# Build the list of (ckpt_label, ckpt_args) pairs to iterate over
+# Each entry: "label|args" where args are the flags to pass to the python script
+declare -a CKPT_ENTRIES
+if [ -n "$CKPT_PATH" ]; then
+    # Explicit path mode: derive label from filename (e.g. "model_last" from "ckpts/.../model_last.pt")
+    ckpt_basename=$(basename "$CKPT_PATH")
+    ckpt_label="${ckpt_basename%.*}"  # strip extension
+    CKPT_ENTRIES=("${ckpt_label}|--ckpt_path ${CKPT_PATH}")
+    echo "======== Using explicit checkpoint: ${CKPT_PATH} (label: ${ckpt_label})"
+else
+    for step in "${CKPTSTEPS[@]}"; do
+        CKPT_ENTRIES+=("${step}|-c ${step}")
+    done
+    echo "======== Using checkpoint steps: ${CKPTSTEPS[*]}"
+fi
+
+# Build config args
+CONFIG_ARGS=""
+if [ -n "$CONFIG_NAME" ] && [ "$CONFIG_NAME" != "$MODEL_NAME" ]; then
+    CONFIG_ARGS="--config ${CONFIG_NAME}"
+fi
+
 # Main execution loop
-for ckptstep in "${CKPTSTEPS[@]}"; do
-    echo "======== Processing ckptstep: ${ckptstep}"
+for entry in "${CKPT_ENTRIES[@]}"; do
+    ckpt_label="${entry%%|*}"
+    ckpt_args="${entry##*|}"
+    
+    echo "======== Processing checkpoint: ${ckpt_label}"
     
     for seed in "${SEEDS[@]}"; do
         echo "-------- Processing seed: ${seed}"
@@ -83,16 +127,30 @@ for ckptstep in "${CKPTSTEPS[@]}"; do
         
         # Execute each infer task sequentially
         for task in "${TASKS[@]}"; do
-            echo ">>>>>>>> Executing infer task: accelerate launch src/f5_tts/eval/eval_infer_batch.py -s ${seed} -n \"${MODEL_NAME}\" -t \"${task}\" -c ${ckptstep} $LOCAL"
-            
-            # Execute infer task (foreground execution, wait for completion)
-            accelerate launch src/f5_tts/eval/eval_infer_batch.py -s ${seed} -n "${MODEL_NAME}" -t "${task}" -c ${ckptstep} -p "${LS_TEST_CLEAN_PATH}" $LOCAL
+            echo ">>>>>>>> Executing infer task: accelerate launch src/f5_tts/eval/eval_infer_batch.py -s ${seed} -n \"${MODEL_NAME}\" -t \"${task}\" ${ckpt_args} ${CONFIG_ARGS} $LOCAL"
+
+            for mode in "${MODES[@]}"; do   
+                MODE_ARGS=""
+                case $mode in
+                    reffree) MODE_ARGS="--reffree --speech_encoder microsoft/wavlm-large" ;;
+                    oracle)  MODE_ARGS="--ref_text_mode oracle" ;;
+                    asr)     MODE_ARGS="--ref_text_mode asr" ;;
+                esac
+
+                echo ">>>>>>>> Mode: ${mode}"
+                accelerate launch src/f5_tts/eval/eval_infer_batch.py \
+                    -s ${seed} -n "${MODEL_NAME}" -t "${task}" \
+                    ${ckpt_args} ${CONFIG_ARGS} \
+                    -p "${LS_TEST_CLEAN_PATH}" $LOCAL \
+                    ${MODE_ARGS}
+            done
             
             # If not infer-only mode, launch corresponding eval task
             if [ "$INFER_ONLY" = false ]; then
-                # Launch corresponding eval task (background execution, non-blocking for next infer)
-                execute_eval_tasks $ckptstep $seed $task &
-                eval_pids+=($!)
+                for mode in "${MODES[@]}"; do
+                    execute_eval_tasks "$ckpt_label" $seed $task $mode &
+                    eval_pids+=($!)
+                done
             fi
         done
         
@@ -109,7 +167,7 @@ for ckptstep in "${CKPTSTEPS[@]}"; do
         echo "-------- All eval tasks for seed ${seed} completed"
     done
     
-    echo "======== Completed ckptstep: ${ckptstep}"
+    echo "======== Completed checkpoint: ${ckpt_label}"
     echo
 done
 
