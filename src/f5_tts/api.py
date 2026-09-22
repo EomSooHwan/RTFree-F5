@@ -35,6 +35,7 @@ class F5TTS:
         model_cfg = OmegaConf.load(str(files("f5_tts").joinpath(f"configs/{model}.yaml")))
         model_cls = get_class(f"f5_tts.model.{model_cfg.model.backbone}")
         model_arc = model_cfg.model.arch
+        self.rtfree = model_cfg.model.get("speech_encoder", None) is not None  # RTFree-F5: no reference transcript
 
         self.mel_spec_type = model_cfg.model.mel_spec.mel_spec_type
         self.target_sample_rate = model_cfg.model.mel_spec.target_sample_rate
@@ -76,11 +77,21 @@ class F5TTS:
             ckpt_step = 1200000
 
         if not ckpt_file:
+            assert not self.rtfree, "RTFree_F5: pass ckpt_file"
             ckpt_file = str(
                 cached_path(f"hf://SWivid/{repo_name}/{model}/model_{ckpt_step}.{ckpt_type}", cache_dir=hf_cache_dir)
             )
         self.ema_model = load_model(
-            model_cls, model_arc, ckpt_file, self.mel_spec_type, vocab_file, self.ode_method, self.use_ema, self.device
+            model_cls,
+            model_arc,
+            ckpt_file,
+            self.mel_spec_type,
+            vocab_file,
+            self.ode_method,
+            self.use_ema,
+            self.device,
+            speech_encoder_name=model_cfg.model.get("speech_encoder", None),
+            projector_hidden_dim=model_cfg.model.get("projector_hidden_dim", None),
         )
 
     def transcribe(self, ref_audio, language=None):
@@ -98,7 +109,7 @@ class F5TTS:
     def infer(
         self,
         ref_file,
-        ref_text,
+        ref_text,  # RTFree_F5: may be "" (then only used, if given, to estimate the output duration)
         gen_text,
         show_info=print,
         progress=tqdm,
@@ -119,7 +130,7 @@ class F5TTS:
         seed_everything(seed)
         self.seed = seed
 
-        ref_file, ref_text = preprocess_ref_audio_text(ref_file, ref_text)
+        ref_file, ref_text = preprocess_ref_audio_text(ref_file, ref_text, transcribe_if_missing=not self.rtfree)
 
         wav, sr, spec = infer_process(
             ref_file,
@@ -138,6 +149,7 @@ class F5TTS:
             speed=speed,
             fix_duration=fix_duration,
             device=self.device,
+            rtfree=self.rtfree,
         )
 
         if file_wave is not None:

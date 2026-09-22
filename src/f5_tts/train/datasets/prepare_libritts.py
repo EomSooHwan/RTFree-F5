@@ -18,7 +18,9 @@ def deal_with_audio_dir(audio_dir):
     sub_result, durations = [], []
     vocab_set = set()
     audio_lists = list(audio_dir.rglob("*.wav"))
-    speaker_id = audio_dir.name
+    speaker_id = (
+        audio_dir.name
+    )  # LibriTTS: <subset>/<speaker_id>/<chapter_id>/*.wav; needed for RTFree-F5 cross-utterance pairs
 
     for line in audio_lists:
         text_path = line.with_suffix(".normalized.txt")
@@ -26,10 +28,7 @@ def deal_with_audio_dir(audio_dir):
         duration = sf.info(line).duration
         if duration < 0.4 or duration > 30:
             continue
-        sub_result.append({"audio_path": str(line),
-                           "text": text,
-                           "duration": duration,
-                           "speaker_id": speaker_id})
+        sub_result.append({"audio_path": str(line), "text": text, "duration": duration, "speaker_id": speaker_id})
         durations.append(duration)
         vocab_set.update(list(text))
     return sub_result, durations, vocab_set
@@ -85,10 +84,12 @@ def main():
 if __name__ == "__main__":
     max_workers = 36
 
-    tokenizer = "pinyin"  # "pinyin" | "char"
+    tokenizer = (
+        "pinyin"  # "pinyin" | "char", must match the vocab of the checkpoint you fine-tune (F5TTS_v1_Base: pinyin)
+    )
 
     SUB_SET = ["train-clean-100", "train-clean-360", "train-other-500"]
-    dataset_dir = "/data2/esyoon_hdd/soohwan/interspeech26/LibriTTS"
+    dataset_dir = "<SOME_PATH>/LibriTTS"
     dataset_name = f"LibriTTS_{'_'.join(SUB_SET)}_{tokenizer}".replace("train-clean-", "").replace("train-other-", "")
     save_dir = str(files("f5_tts").joinpath("../../")) + f"/data/{dataset_name}"
     print(f"\nPrepare for {dataset_name}, will save to {save_dir}\n")

@@ -53,7 +53,18 @@ accelerate launch src/f5_tts/train/train.py --config-name F5TTS_v1_Base.yaml
 accelerate launch --mixed_precision=fp16 src/f5_tts/train/train.py --config-name F5TTS_v1_Base.yaml ++datasets.batch_size_per_gpu=19200
 ```
 
-### 2. Finetuning practice
+### 2. RTFree-F5
+
+RTFree-F5 is trained with `finetune_cli.py` from the pretrained F5-TTS v1 Base checkpoint, in two stages
+(`--exp_name RTFree_F5 --stage 1|2`); see the top-level README for the exact commands. Notes:
+
+- The dataset needs a `speaker_id` column (`prepare_libritts.py` writes it) since training samples same-speaker
+  reference/target pairs (`CrossUtteranceDataset`), and its `vocab.txt` must be the one of the pretrained checkpoint.
+- `--batch_size_per_gpu` counts the frames of the reference utterances; the target utterance adds about as much again.
+- `--learning_rate` applies to the DiT backbone (stage 2), `--lr_projector` to the projector.
+- A `pretrained_*` checkpoint in the run directory only initializes the weights; `model_last.pt` resumes training.
+
+### 3. Finetuning practice
 Discussion board for Finetuning [#57](https://github.com/SWivid/F5-TTS/discussions/57).
 
 Gradio UI training/finetuning with `src/f5_tts/train/finetune_gradio.py` see [#143](https://github.com/SWivid/F5-TTS/discussions/143).
@@ -64,7 +75,7 @@ If use tensorboard as logger, install it first with `pip install tensorboard`.
 
 <ins>The `use_ema = True` might be harmful for early-stage finetuned checkpoints</ins> (which goes just few updates, thus ema weights still dominated by pretrained ones), try turn it off with finetune gradio option or `load_model(..., use_ema=False)`, see if offer better results.
 
-### 3. W&B Logging
+### 4. W&B Logging
 
 The `wandb/` dir will be created under path you run training/finetuning scripts.
 

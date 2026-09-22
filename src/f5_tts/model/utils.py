@@ -106,6 +106,21 @@ def list_str_to_idx(
     return text
 
 
+# partial state dict loading (RTFree-F5: F5-TTS checkpoints lack projector weights, RTFree checkpoints omit the frozen WavLM)
+
+
+def filter_state_dict(model, state_dict):
+    """
+    Split `state_dict` into the entries loadable into `model` (present, same shape) and the rest.
+    Returns (loadable, missing, unexpected) where missing/unexpected are key lists w.r.t. the model.
+    """
+    model_state = model.state_dict()
+    loadable = {k: v for k, v in state_dict.items() if k in model_state and model_state[k].shape == v.shape}
+    missing = [k for k in model_state if k not in loadable]
+    unexpected = [k for k in state_dict if k not in loadable]
+    return loadable, missing, unexpected
+
+
 # Get tokenizer
 
 

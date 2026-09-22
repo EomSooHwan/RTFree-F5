@@ -1,269 +1,141 @@
-# F5-TTS: A Fairytaler that Fakes Fluent and Faithful Speech with Flow Matching
+# RTFree-F5: Transcript-Free Flow-Matching TTS via Speech Feature Conditioning
 
-[![python](https://img.shields.io/badge/Python-3.10-brightgreen)](https://github.com/SWivid/F5-TTS)
-[![arXiv](https://img.shields.io/badge/arXiv-2410.06885-b31b1b.svg?logo=arXiv)](https://arxiv.org/abs/2410.06885)
-[![demo](https://img.shields.io/badge/GitHub-Demo-orange.svg)](https://swivid.github.io/F5-TTS/)
-[![hfspace](https://img.shields.io/badge/🤗-HF%20Space-yellow)](https://huggingface.co/spaces/mrfakename/E2-F5-TTS)
-[![msspace](https://img.shields.io/badge/🤖-MS%20Space-blue)](https://modelscope.cn/studios/AI-ModelScope/E2-F5-TTS)
-[![lab](https://img.shields.io/badge/🏫-X--LANCE-grey?labelColor=lightgrey)](https://x-lance.sjtu.edu.cn/)
-[![lab](https://img.shields.io/badge/🏫-SII-grey?labelColor=lightgrey)](https://www.sii.edu.cn/)
-[![lab](https://img.shields.io/badge/🏫-PCL-grey?labelColor=lightgrey)](https://www.pcl.ac.cn)
-<!-- <img src="https://github.com/user-attachments/assets/12d7749c-071a-427c-81bf-b87b91def670" alt="Watermark" style="width: 40px; height: auto"> -->
+[![arXiv](https://img.shields.io/badge/arXiv-2606.20266-b31b1b.svg?logo=arXiv)](https://arxiv.org/abs/2606.20266)
+[![python](https://img.shields.io/badge/Python-3.10+-brightgreen)](https://github.com/EomSooHwan/RTFree-F5)
 
-**F5-TTS**: Diffusion Transformer with ConvNeXt V2, faster trained and inference.
+Official code for **"Transcript-Free Flow-Matching Text-to-Speech via Speech Feature Conditioning"** (Interspeech 2026).
 
-**E2 TTS**: Flat-UNet Transformer, closest reproduction from [paper](https://arxiv.org/abs/2406.18009).
+Zero-shot TTS models such as [F5-TTS](https://github.com/SWivid/F5-TTS) need a transcript of the reference audio at
+inference time, usually from an ASR system. This makes them brittle exactly where zero-shot TTS is most useful:
+accented and dysarthric speakers. RTFree-F5 (**R**eference-**T**ranscript-**Free** F5) replaces the reference transcript
+with continuous self-supervised speech features:
 
-**Sway Sampling**: Inference-time flow step sampling strategy, greatly improves performance
+- a frozen **WavLM-Large** encodes the reference audio;
+- a lightweight **MLP projector** (0.8M parameters) maps the features into F5-TTS's text-conditioning space;
+- the DiT backbone then sees `[projected speech features ; target-text features]` instead of
+  `[reference-text features ; target-text features]`, so the pretrained F5-TTS checkpoint is reused as is.
 
-### Thanks to all the contributors !
+Training uses cross-utterance pairs of the same speaker in two stages: (1) projector only, with F5-TTS frozen;
+(2) projector + DiT backbone, with the text encoder and WavLM frozen.
+On dysarthric speech (SAP), WER drops from 24.6% (original recordings) to 10.4%, below the F5-TTS baseline given the
+ground-truth reference transcript (20.7%), while naturalness improves and results on standard benchmarks stay competitive.
 
-## News
-- **2025/03/12**: 🔥 F5-TTS v1 base model with better training and inference performance. [Few demo](https://swivid.github.io/F5-TTS_updates).
-- **2024/10/08**: F5-TTS & E2 TTS base models on [🤗 Hugging Face](https://huggingface.co/SWivid/F5-TTS), [🤖 Model Scope](https://www.modelscope.cn/models/SWivid/F5-TTS_Emilia-ZH-EN), [🟣 Wisemodel](https://wisemodel.cn/models/SJTU_X-LANCE/F5-TTS_Emilia-ZH-EN).
+This repository is a fork of [F5-TTS](https://github.com/SWivid/F5-TTS); everything specific to RTFree-F5 is marked
+`RTFree-F5` in the code. Main additions:
+
+| File | What |
+|---|---|
+| `src/f5_tts/model/speech_encoder.py` | frozen WavLM encoder, MLP projector, frame-rate alignment |
+| `src/f5_tts/model/cfm.py`, `model/backbones/dit.py` | speech-feature conditioning hooks, two-stage freezing |
+| `src/f5_tts/model/dataset.py` | `CrossUtteranceDataset` (same-speaker reference/target pairs) |
+| `src/f5_tts/model/trainer.py`, `train/finetune_cli.py` | stage-wise training, projector learning rate |
+| `src/f5_tts/configs/RTFree_F5.yaml` | model config |
+| `src/f5_tts/eval/` | baselines with oracle / ASR reference transcripts, SAP and L2-ARCTIC evaluation |
 
 ## Installation
 
-### Create a separate environment if needed
-
 ```bash
-# Create a conda env with python_version>=3.10  (you could also use virtualenv)
-conda create -n f5-tts python=3.11
-conda activate f5-tts
-
-# Install FFmpeg if you haven't yet
+conda create -n rtfree python=3.11 && conda activate rtfree
 conda install ffmpeg
+# install torch / torchaudio for your CUDA version first, e.g.
+pip install torch==2.8.0+cu128 torchaudio==2.8.0+cu128 --extra-index-url https://download.pytorch.org/whl/cu128
+
+git clone https://github.com/EomSooHwan/RTFree-F5.git
+cd RTFree-F5
+pip install -e .        # add .[eval] for the evaluation tools
 ```
 
-### Install PyTorch with matched device
+## Checkpoints
 
-<details>
-<summary>NVIDIA GPU</summary>
+| Model | Description | Download |
+|---|---|---|
+| RTFree-F5 (Stage 2) | main model of the paper, trained on LibriTTS | *coming soon* |
+| RTFree-F5 (Stage 1) | projector only | *coming soon* |
 
-> ```bash
-> # Install pytorch with your CUDA version, e.g.
-> pip install torch==2.8.0+cu128 torchaudio==2.8.0+cu128 --extra-index-url https://download.pytorch.org/whl/cu128
-> 
-> # And also possible previous versions, e.g.
-> pip install torch==2.4.0+cu124 torchaudio==2.4.0+cu124 --extra-index-url https://download.pytorch.org/whl/cu124
-> # etc.
-> ```
-
-</details>
-
-<details>
-<summary>AMD GPU</summary>
-
-> ```bash
-> # Install pytorch with your ROCm version (Linux only), e.g.
-> pip install torch==2.5.1+rocm6.2 torchaudio==2.5.1+rocm6.2 --extra-index-url https://download.pytorch.org/whl/rocm6.2
-> ```
-
-</details>
-
-<details>
-<summary>Intel GPU</summary>
-
-> ```bash
-> # Install pytorch with your XPU version, e.g.
-> # Intel® Deep Learning Essentials or Intel® oneAPI Base Toolkit must be installed
-> pip install torch torchaudio --index-url https://download.pytorch.org/whl/test/xpu
-> 
-> # Intel GPU support is also available through IPEX (Intel® Extension for PyTorch)
-> # IPEX does not require the Intel® Deep Learning Essentials or Intel® oneAPI Base Toolkit
-> # See: https://pytorch-extension.intel.com/installation?request=platform
-> ```
-
-</details>
-
-<details>
-<summary>Apple Silicon</summary>
-
-> ```bash
-> # Install the stable pytorch, e.g.
-> pip install torch torchaudio
-> ```
-
-</details>
-
-### Then you can choose one from below:
-
-> ### 1. As a pip package (if just for inference)
-> 
-> ```bash
-> pip install f5-tts
-> ```
-> 
-> ### 2. Local editable (if also do training, finetuning)
-> 
-> ```bash
-> git clone https://github.com/SWivid/F5-TTS.git
-> cd F5-TTS
-> # git submodule update --init --recursive  # (optional, if use bigvgan as vocoder)
-> pip install -e .
-> ```
-
-### Docker usage also available
-```bash
-# Build from Dockerfile
-docker build -t f5tts:v1 .
-
-# Run from GitHub Container Registry
-docker container run --rm -it --gpus=all --mount 'type=volume,source=f5-tts,target=/root/.cache/huggingface/hub/' -p 7860:7860 ghcr.io/swivid/f5-tts:main
-
-# Quickstart if you want to just run the web interface (not CLI)
-docker container run --rm -it --gpus=all --mount 'type=volume,source=f5-tts,target=/root/.cache/huggingface/hub/' -p 7860:7860 ghcr.io/swivid/f5-tts:main f5-tts_infer-gradio --host 0.0.0.0
-```
-
-### Runtime
-
-Deployment solution with Triton and TensorRT-LLM.
-
-#### Benchmark Results
-Decoding on a single L20 GPU, using 26 different prompt_audio & target_text pairs, 16 NFE.
-
-| Model               | Concurrency    | Avg Latency | RTF    | Mode            |
-|---------------------|----------------|-------------|--------|-----------------|
-| F5-TTS Base (Vocos) | 2              | 253 ms      | 0.0394 | Client-Server   |
-| F5-TTS Base (Vocos) | 1 (Batch_size) | -           | 0.0402 | Offline TRT-LLM |
-| F5-TTS Base (Vocos) | 1 (Batch_size) | -           | 0.1467 | Offline Pytorch |
-
-See [detailed instructions](src/f5_tts/runtime/triton_trtllm/README.md) for more information.
-
+The pretrained F5-TTS v1 Base checkpoint and WavLM-Large are downloaded automatically from Hugging Face.
 
 ## Inference
 
-- In order to achieve desired performance, take a moment to read [detailed guidance](src/f5_tts/infer).
-- By properly searching the keywords of problem encountered, [issues](https://github.com/SWivid/F5-TTS/issues?q=is%3Aissue) are very helpful.
-
-### 1. Gradio App
-
-Currently supported features:
-
-- Basic TTS with Chunk Inference
-- Multi-Style / Multi-Speaker Generation
-- Voice Chat powered by Qwen2.5-3B-Instruct
-- [Custom inference with more language support](src/f5_tts/infer/SHARED.md)
+No reference transcript is needed:
 
 ```bash
-# Launch a Gradio app (web interface)
-f5-tts_infer-gradio
-
-# Specify the port/host
-f5-tts_infer-gradio --port 7860 --host 0.0.0.0
-
-# Launch a share link
-f5-tts_infer-gradio --share
+f5-tts_infer-cli --model RTFree_F5 --ckpt_file ckpts/RTFree_F5/model_last.pt \
+    --ref_audio "path/to/reference.wav" \
+    --gen_text "The text you want to synthesize in the reference speaker's voice."
 ```
 
-<details>
-<summary>NVIDIA device docker compose file example</summary>
+The output duration is estimated from the reference speaking rate. Without a transcript this uses a fixed
+prior (about 15 characters per second); pass `--ref_text` to estimate it from the actual transcript, or
+`--fix_duration <seconds>` to set the total duration directly. Other options (NFE, CFG strength, sway sampling,
+speed, vocoder) are the same as in F5-TTS, see `f5-tts_infer-cli --help`.
 
-```yaml
-services:
-  f5-tts:
-    image: ghcr.io/swivid/f5-tts:main
-    ports:
-      - "7860:7860"
-    environment:
-      GRADIO_SERVER_PORT: 7860
-    entrypoint: ["f5-tts_infer-gradio", "--port", "7860", "--host", "0.0.0.0"]
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+Python API:
 
-volumes:
-  f5-tts:
-    driver: local
+```python
+from f5_tts.api import F5TTS
+
+tts = F5TTS(model="RTFree_F5", ckpt_file="ckpts/RTFree_F5/model_last.pt")
+wav, sr, spec = tts.infer(ref_file="reference.wav", ref_text="", gen_text="Hello world.", file_wave="out.wav")
 ```
-
-</details>
-
-### 2. CLI Inference
-
-```bash
-# Run with flags
-# Leave --ref_text "" will have ASR model transcribe (extra GPU memory usage)
-f5-tts_infer-cli --model F5TTS_v1_Base \
---ref_audio "provide_prompt_wav_path_here.wav" \
---ref_text "The content, subtitle or transcription of reference audio." \
---gen_text "Some text you want TTS model generate for you."
-
-# Run with default setting. src/f5_tts/infer/examples/basic/basic.toml
-f5-tts_infer-cli
-# Or with your own .toml file
-f5-tts_infer-cli -c custom.toml
-
-# Multi voice. See src/f5_tts/infer/README.md
-f5-tts_infer-cli -c src/f5_tts/infer/examples/multi/story.toml
-```
-
 
 ## Training
 
-### 1. With Hugging Face Accelerate
+Training fine-tunes the pretrained F5-TTS v1 Base checkpoint on LibriTTS (train-clean-100/360, train-other-500).
 
-Refer to [training & finetuning guidance](src/f5_tts/train) for best practice.
+1. Prepare LibriTTS (fill in `dataset_dir` in the script; it also stores the speaker id of every utterance):
 
-### 2. With Gradio App
+   ```bash
+   python src/f5_tts/train/datasets/prepare_libritts.py
+   # the fine-tuned model must keep the vocabulary of the pretrained checkpoint
+   cp data/Emilia_ZH_EN_pinyin/vocab.txt data/LibriTTS_100_360_500_pinyin/vocab.txt
+   ```
 
-```bash
-# Quick start with Gradio web interface
-f5-tts_finetune-gradio
+2. Stage 1, cross-modal alignment (projector only, F5-TTS frozen; ~1-2 days on 4 A100s):
+
+   ```bash
+   accelerate launch src/f5_tts/train/finetune_cli.py --exp_name RTFree_F5 --stage 1 --finetune \
+       --dataset_name LibriTTS_100_360_500 --run_name rtfree_stage1 \
+       --epochs 10 --learning_rate 1e-5 --lr_projector 5e-5 --logger wandb
+   ```
+
+3. Stage 2, joint fine-tuning (projector + DiT backbone; ~2-3 days on 4 A100s), initialized from stage 1:
+
+   ```bash
+   accelerate launch src/f5_tts/train/finetune_cli.py --exp_name RTFree_F5 --stage 2 --finetune \
+       --pretrain ckpts/LibriTTS_100_360_500/rtfree_stage1/model_last.pt \
+       --dataset_name LibriTTS_100_360_500 --run_name rtfree_stage2 \
+       --epochs 20 --learning_rate 1e-5 --lr_projector 5e-5 --logger wandb
+   ```
+
+`--batch_size_per_gpu` (frames per GPU, counted on the reference utterance), `--num_warmup_updates` and the other
+options follow F5-TTS; run `accelerate config` first for multi-GPU / mixed precision. Checkpoints land in
+`ckpts/<dataset_name>/<run_name>/`; re-launching the same command resumes from `model_last.pt`.
+The frozen WavLM weights are not stored in checkpoints.
+
+## Evaluation
+
+See [`src/f5_tts/eval`](src/f5_tts/eval) for the objective evaluation (WER / SIM / UTMOS) on LibriSpeech-PC,
+Seed-TTS test-en, SAP (dysarthric) and L2-ARCTIC (non-native), including the F5-TTS baselines with oracle and
+Whisper-transcribed reference text.
+
+## Citation
+
+```bibtex
+@inproceedings{eom2026rtfree,
+  title     = {Transcript-Free Flow-Matching Text-to-Speech via Speech Feature Conditioning},
+  author    = {Eom, SooHwan and Yoon, Hee Suk and Yoon, Eunseop and Hasegawa-Johnson, Mark and Yoo, Chang D.},
+  booktitle = {Interspeech},
+  year      = {2026}
+}
 ```
-
-Read [training & finetuning guidance](src/f5_tts/train) for more instructions.
-
-
-## [Evaluation](src/f5_tts/eval)
-
-
-## Development
-
-Use pre-commit to ensure code quality (will run linters and formatters automatically):
-
-```bash
-pip install pre-commit
-pre-commit install
-```
-
-When making a pull request, before each commit, run: 
-
-```bash
-pre-commit run --all-files
-```
-
-Note: Some model components have linting exceptions for E722 to accommodate tensor notation.
-
 
 ## Acknowledgements
 
-- [E2-TTS](https://arxiv.org/abs/2406.18009) brilliant work, simple and effective
-- [Emilia](https://arxiv.org/abs/2407.05361), [WenetSpeech4TTS](https://arxiv.org/abs/2406.05763), [LibriTTS](https://arxiv.org/abs/1904.02882), [LJSpeech](https://keithito.com/LJ-Speech-Dataset/) valuable datasets
-- [lucidrains](https://github.com/lucidrains) initial CFM structure with also [bfs18](https://github.com/bfs18) for discussion
-- [SD3](https://arxiv.org/abs/2403.03206) & [Hugging Face diffusers](https://github.com/huggingface/diffusers) DiT and MMDiT code structure
-- [torchdiffeq](https://github.com/rtqichen/torchdiffeq) as ODE solver, [Vocos](https://huggingface.co/charactr/vocos-mel-24khz) and [BigVGAN](https://github.com/NVIDIA/BigVGAN) as vocoder
-- [FunASR](https://github.com/modelscope/FunASR), [faster-whisper](https://github.com/SYSTRAN/faster-whisper), [UniSpeech](https://github.com/microsoft/UniSpeech), [SpeechMOS](https://github.com/tarepan/SpeechMOS) for evaluation tools
-- [ctc-forced-aligner](https://github.com/MahmoudAshraf97/ctc-forced-aligner) for speech edit test
-- [mrfakename](https://x.com/realmrfakename) huggingface space demo ~
-- [f5-tts-mlx](https://github.com/lucasnewman/f5-tts-mlx/tree/main) Implementation with MLX framework by [Lucas Newman](https://github.com/lucasnewman)
-- [F5-TTS-ONNX](https://github.com/DakeQQ/F5-TTS-ONNX) ONNX Runtime version by [DakeQQ](https://github.com/DakeQQ)
-- [Yuekai Zhang](https://github.com/yuekaizhang) Triton and TensorRT-LLM support ~
+Built on [F5-TTS](https://github.com/SWivid/F5-TTS) (Chen et al., 2024); please also cite it if you use this code.
+Speech features from [WavLM](https://github.com/microsoft/unilm/tree/master/wavlm), vocoder from
+[Vocos](https://github.com/gemelo-ai/vocos).
 
-## Citation
-If our work and codebase is useful for you, please cite as:
-```
-@article{chen-etal-2024-f5tts,
-      title={F5-TTS: A Fairytaler that Fakes Fluent and Faithful Speech with Flow Matching}, 
-      author={Yushen Chen and Zhikang Niu and Ziyang Ma and Keqi Deng and Chunhui Wang and Jian Zhao and Kai Yu and Xie Chen},
-      journal={arXiv preprint arXiv:2410.06885},
-      year={2024},
-}
-```
 ## License
 
-Our code is released under MIT License. The pre-trained models are licensed under the CC-BY-NC license due to the training data Emilia, which is an in-the-wild dataset. Sorry for any inconvenience this may cause.
+Code is released under the MIT License (see [LICENSE](LICENSE)). The pretrained F5-TTS weights are CC-BY-NC licensed
+because of their training data; the same applies to checkpoints derived from them.

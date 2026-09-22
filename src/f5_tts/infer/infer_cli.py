@@ -52,7 +52,7 @@ parser.add_argument(
     "-m",
     "--model",
     type=str,
-    help="The model name: F5TTS_v1_Base | F5TTS_Base | E2TTS_Base | etc.",
+    help="The model name: F5TTS_v1_Base | F5TTS_Base | E2TTS_Base | RTFree_F5 | etc.",
 )
 parser.add_argument(
     "-mc",
@@ -82,7 +82,8 @@ parser.add_argument(
     "-s",
     "--ref_text",
     type=str,
-    help="The transcript/subtitle for the reference audio",
+    help="The transcript/subtitle for the reference audio. "
+    "Not needed by RTFree_F5 (if given, it only helps estimating the output duration)",
 )
 parser.add_argument(
     "-t",
@@ -188,12 +189,18 @@ model = args.model or config.get("model", "F5TTS_v1_Base")
 ckpt_file = args.ckpt_file or config.get("ckpt_file", "")
 vocab_file = args.vocab_file or config.get("vocab_file", "")
 
-ref_audio = args.ref_audio or config.get("ref_audio", "infer/examples/basic/basic_ref_en.wav")
-ref_text = (
-    args.ref_text
-    if args.ref_text is not None
-    else config.get("ref_text", "Some call me nature, others call me mother nature.")
+model_cfg = OmegaConf.load(
+    args.model_cfg or config.get("model_cfg", str(files("f5_tts").joinpath(f"configs/{model}.yaml")))
 )
+rtfree = model_cfg.model.get("speech_encoder", None) is not None  # RTFree-F5: no reference transcript needed
+
+ref_audio = args.ref_audio or config.get("ref_audio", "infer/examples/basic/basic_ref_en.wav")
+if args.ref_text is not None:
+    ref_text = args.ref_text
+elif rtfree:
+    ref_text = ""
+else:
+    ref_text = config.get("ref_text", "Some call me nature, others call me mother nature.")
 gen_text = args.gen_text or config.get("gen_text", "Here we generate something just for test.")
 gen_file = args.gen_file or config.get("gen_file", "")
 
@@ -265,9 +272,6 @@ vocoder = load_vocoder(
 
 # load TTS model
 
-model_cfg = OmegaConf.load(
-    args.model_cfg or config.get("model_cfg", str(files("f5_tts").joinpath(f"configs/{model}.yaml")))
-)
 model_cls = get_class(f"f5_tts.model.{model_cfg.model.backbone}")
 model_arc = model_cfg.model.arch
 
@@ -288,6 +292,7 @@ elif model == "E2TTS_Base":
     ckpt_step = 1200000
 
 if not ckpt_file:
+    assert not rtfree, "RTFree_F5: pass the checkpoint with --ckpt_file (see README)"
     ckpt_file = str(cached_path(f"hf://SWivid/{repo_name}/{model}/model_{ckpt_step}.{ckpt_type}"))
 elif ckpt_file.startswith("hf://"):
     ckpt_file = str(cached_path(ckpt_file))
@@ -297,7 +302,14 @@ if vocab_file.startswith("hf://"):
 
 print(f"Using {model}...")
 ema_model = load_model(
-    model_cls, model_arc, ckpt_file, mel_spec_type=vocoder_name, vocab_file=vocab_file, device=device
+    model_cls,
+    model_arc,
+    ckpt_file,
+    mel_spec_type=vocoder_name,
+    vocab_file=vocab_file,
+    device=device,
+    speech_encoder_name=model_cfg.model.get("speech_encoder", None),
+    projector_hidden_dim=model_cfg.model.get("projector_hidden_dim", None),
 )
 
 
@@ -315,7 +327,7 @@ def main():
         print("Voice:", voice)
         print("ref_audio ", voices[voice]["ref_audio"])
         voices[voice]["ref_audio"], voices[voice]["ref_text"] = preprocess_ref_audio_text(
-            voices[voice]["ref_audio"], voices[voice]["ref_text"]
+            voices[voice]["ref_audio"], voices[voice]["ref_text"], transcribe_if_missing=not rtfree
         )
         print("ref_audio_", voices[voice]["ref_audio"], "\n\n")
 
@@ -356,6 +368,7 @@ def main():
             speed=local_speed,
             fix_duration=fix_duration,
             device=device,
+            rtfree=rtfree,
         )
         generated_audio_segments.append(audio_segment)
 

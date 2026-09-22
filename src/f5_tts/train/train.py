@@ -13,14 +13,6 @@ from f5_tts.model.utils import get_tokenizer
 
 os.chdir(str(files("f5_tts").joinpath("../..")))  # change working directory to root of project (local editable)
 
-import argparse, sys
-def _parse_stage():
-    p = argparse.ArgumentParser(add_help=False)
-    p.add_argument("--stage", type=int, choices=[1,2], default=None)
-    args, rest = p.parse_known_args()
-    sys.argv = [sys.argv[0]] + rest
-    return args.stage
-STAGE = _parse_stage()
 
 @hydra.main(version_base="1.3", config_path=str(files("f5_tts").joinpath("configs")), config_name=None)
 def main(model_cfg):
@@ -40,12 +32,10 @@ def main(model_cfg):
     vocab_char_map, vocab_size = get_tokenizer(tokenizer_path, tokenizer)
 
     # set model
-    speech_encoder_name = "microsoft/wavlm-large" if STAGE else None
     model = CFM(
         transformer=model_cls(**model_arc, text_num_embeds=vocab_size, mel_dim=model_cfg.model.mel_spec.n_mel_channels),
         mel_spec_kwargs=model_cfg.model.mel_spec,
         vocab_char_map=vocab_char_map,
-        speech_encoder_name=speech_encoder_name,
     )
 
     # init trainer
@@ -73,14 +63,9 @@ def main(model_cfg):
         is_local_vocoder=model_cfg.model.vocoder.is_local,
         local_vocoder_path=model_cfg.model.vocoder.local_path,
         model_cfg_dict=OmegaConf.to_container(model_cfg, resolve=True),
-        stage=STAGE,
     )
 
-    train_dataset = load_dataset(model_cfg.datasets.name,
-                                 tokenizer,
-                                 mel_spec_kwargs=model_cfg.model.mel_spec,
-                                 cross_utterance=(STAGE is not None),
-                                 )
+    train_dataset = load_dataset(model_cfg.datasets.name, tokenizer, mel_spec_kwargs=model_cfg.model.mel_spec)
     trainer.train(
         train_dataset,
         num_workers=model_cfg.datasets.num_workers,

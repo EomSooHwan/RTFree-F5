@@ -16,8 +16,8 @@ from torch.utils.data import DataLoader, Dataset, SequentialSampler
 from tqdm import tqdm
 
 from f5_tts.model import CFM
-from f5_tts.model.dataset import DynamicBatchSampler, collate_fn
-from f5_tts.model.utils import default, exists
+from f5_tts.model.dataset import CrossUtteranceDataset, DynamicBatchSampler, collate_fn, cross_utterance_collate_fn
+from f5_tts.model.utils import default, exists, filter_state_dict
 
 
 # trainer
@@ -53,8 +53,8 @@ class Trainer:
         is_local_vocoder: bool = False,  # use local path vocoder
         local_vocoder_path: str = "",  # local vocoder path
         model_cfg_dict: dict = dict(),  # training config
-        stage=None,
-        lr_projector=None,
+        stage: int | None = None,  # RTFree-F5: 1 (projector only) | 2 (projector + DiT); None for vanilla F5-TTS
+        lr_projector: float | None = None,  # RTFree-F5: projector learning rate, defaults to learning_rate
     ):
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 
@@ -87,6 +87,8 @@ class Trainer:
                     "grad_accumulation_steps": grad_accumulation_steps,
                     "max_grad_norm": max_grad_norm,
                     "noise_scheduler": noise_scheduler,
+                    "stage": stage,
+                    "lr_projector": lr_projector,
                 }
             model_cfg_dict["gpus"] = self.accelerator.num_processes
             self.accelerator.init_trackers(
@@ -103,6 +105,9 @@ class Trainer:
                 self.writer = SummaryWriter(log_dir=f"runs/{wandb_run_name}")
 
         self.model = model
+        self.stage = stage
+        if exists(stage):
+            model.set_training_stage(stage)
 
         if self.is_main:
             self.ema_model = EMA(model, include_online_model=False, **ema_kwargs)
@@ -136,46 +141,26 @@ class Trainer:
 
         self.duration_predictor = duration_predictor
 
-        # Build parameter groups with differential learning rates
-        if stage is not None and lr_projector is not None:
-            projector_params = []
-            backbone_params = []
-            
-            for name, param in model.named_parameters():
-                if not param.requires_grad:
-                    continue
-                if "projector" in name:
-                    projector_params.append(param)
-                else:
-                    backbone_params.append(param)
-            
-            param_groups = [
-                {"params": backbone_params, "lr": learning_rate},
-                {"params": projector_params, "lr": lr_projector},
+        if exists(stage):
+            # RTFree-F5: only trainable parameters, with a separate learning rate for the projector
+            lr_projector = default(lr_projector, learning_rate)
+            trainable = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+            params = [
+                {"params": [p for n, p in trainable if not n.startswith("projector.")], "lr": learning_rate},
+                {"params": [p for n, p in trainable if n.startswith("projector.")], "lr": lr_projector},
             ]
-            
             if self.is_main:
-                print(f"\nDifferential LR:")
-                print(f"  Backbone: {learning_rate} ({len(backbone_params)} tensors)")
-                print(f"  Projector: {lr_projector} ({len(projector_params)} tensors)")
-            
-            if bnb_optimizer:
-                import bitsandbytes as bnb
-                self.optimizer = bnb.optim.AdamW8bit(param_groups)
-            else:
-                self.optimizer = AdamW(param_groups)
+                print(f"Learning rate: backbone {learning_rate}, projector {lr_projector}")
         else:
-            # Single LR for all parameters (original behavior)
-            if bnb_optimizer:
-                import bitsandbytes as bnb
-                self.optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=learning_rate)
-            else:
-                self.optimizer = AdamW(model.parameters(), lr=learning_rate)
+            params = model.parameters()
+
+        if bnb_optimizer:
+            import bitsandbytes as bnb
+
+            self.optimizer = bnb.optim.AdamW8bit(params, lr=learning_rate)
+        else:
+            self.optimizer = AdamW(params, lr=learning_rate)
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
-        
-        self.stage = stage
-        if stage is not None:
-            self.accelerator.unwrap_model(self.model).set_training_stage(stage)
 
     @property
     def is_main(self):
@@ -185,9 +170,9 @@ class Trainer:
         self.accelerator.wait_for_everyone()
         if self.is_main:
             checkpoint = dict(
-                model_state_dict=self.accelerator.unwrap_model(self.model).state_dict(),
+                model_state_dict=self._state_dict_to_save(self.accelerator.unwrap_model(self.model).state_dict()),
                 optimizer_state_dict=self.optimizer.state_dict(),
-                ema_model_state_dict=self.ema_model.state_dict(),
+                ema_model_state_dict=self._state_dict_to_save(self.ema_model.state_dict()),
                 scheduler_state_dict=self.scheduler.state_dict(),
                 update=update,
             )
@@ -215,6 +200,13 @@ class Trainer:
                         oldest_checkpoint = checkpoints.pop(0)
                         os.remove(os.path.join(self.checkpoint_path, oldest_checkpoint))
                         print(f"Removed old checkpoint: {oldest_checkpoint}")
+
+    @staticmethod
+    def _state_dict_to_save(state_dict):
+        # the frozen speech encoder is reloaded from its pretrained weights, no need to store it in every checkpoint
+        return {
+            k: v for k, v in state_dict.items() if ".speech_encoder." not in k and not k.startswith("speech_encoder.")
+        }
 
     def load_checkpoint(self):
         if (
@@ -262,45 +254,25 @@ class Trainer:
             if key in checkpoint["ema_model_state_dict"]:
                 del checkpoint["ema_model_state_dict"][key]
 
-        # === ADD: Partial loading for RefFree training ===
-        if self.stage is not None:
-            ema_state = checkpoint["ema_model_state_dict"]
-            model_state = self.accelerator.unwrap_model(self.model).state_dict()
-            
-            # Filter out incompatible keys (shape mismatch or missing)
-            filtered_state = {}
-            skipped = []
-            for k, v in ema_state.items():
-                clean_k = k.replace("ema_model.", "") if k.startswith("ema_model.") else k
-                if clean_k not in model_state:
-                    skipped.append(f"not in model: {k}")
-                    continue
-                if model_state[clean_k].shape != v.shape:
-                    skipped.append(f"shape mismatch: {k} {list(v.shape)} vs {list(model_state[clean_k].shape)}")
-                    continue
-                filtered_state[clean_k] = v
-            
+        if exists(self.stage) and latest_checkpoint.startswith("pretrained_"):
+            # RTFree-F5: a pretrained_* checkpoint only initializes the weights (F5-TTS checkpoint for stage 1,
+            # stage-1 model_last.pt for stage 2), from its EMA weights. Missing projector weights are expected.
+            state_dict = {
+                k.replace("ema_model.", ""): v
+                for k, v in checkpoint["ema_model_state_dict"].items()
+                if k not in ["initted", "update", "step"]
+            }
+            self._load_partial(self.accelerator.unwrap_model(self.model), state_dict, f"{latest_checkpoint} (ema)")
             if self.is_main:
-                print(f"\nPartial checkpoint loading for RefFree stage {self.stage}:")
-                print(f"  Loaded: {len(filtered_state)} / {len(model_state)} parameters")
-                if skipped:
-                    print(f"  Skipped {len(skipped)} keys:")
-                    for s in skipped[:8]:
-                        print(f"    {s}")
-                    if len(skipped) > 8:
-                        print(f"    ... and {len(skipped) - 8} more")
-                
-                self.ema_model.load_state_dict(filtered_state, strict=False)
-            
-            self.accelerator.unwrap_model(self.model).load_state_dict(filtered_state, strict=False)
-            
+                self.ema_model.ema_model.load_state_dict(
+                    filter_state_dict(self.ema_model.ema_model, state_dict)[0], strict=False
+                )
             del checkpoint
             gc.collect()
-            return 0  # Start from update 0
-        # === END ADD ===
+            return 0
 
-        if self.is_main:
-            self.ema_model.load_state_dict(checkpoint["ema_model_state_dict"])
+        if self.is_main:  # RTFree-F5 checkpoints omit the frozen speech encoder, hence non-strict
+            self.ema_model.load_state_dict(checkpoint["ema_model_state_dict"], strict=not exists(self.stage))
 
         if "update" in checkpoint or "step" in checkpoint:
             # patch for backward compatibility, with before f992c4e
@@ -315,7 +287,12 @@ class Trainer:
                 if key in checkpoint["model_state_dict"]:
                     del checkpoint["model_state_dict"][key]
 
-            self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint["model_state_dict"])
+            if exists(self.stage):
+                self._load_partial(
+                    self.accelerator.unwrap_model(self.model), checkpoint["model_state_dict"], latest_checkpoint
+                )
+            else:
+                self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint["model_state_dict"])
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             if self.scheduler:
                 self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
@@ -333,12 +310,25 @@ class Trainer:
         gc.collect()
         return update
 
+    def _load_partial(self, model, state_dict, name):
+        loadable, missing, unexpected = filter_state_dict(model, state_dict)
+        expected_missing = [k for k in missing if k.startswith(("projector.", "speech_encoder."))]
+        unexpected = [k for k in unexpected if not k.startswith("speech_encoder.")]
+        if len(expected_missing) < len(missing) or unexpected:
+            raise RuntimeError(
+                f"Checkpoint {name} does not match the model.\n"
+                f"  missing: {[k for k in missing if k not in expected_missing][:10]}\n"
+                f"  unexpected / shape mismatch: {unexpected[:10]}\n"
+                "  (a vocab.txt different from the pretrained one changes the text embedding shape)"
+            )
+        model.load_state_dict(loadable, strict=False)
+        if self.is_main:
+            print(f"Loaded {len(loadable)} tensors from {name}; newly initialized: {len(expected_missing)}")
+
     def train(self, train_dataset: Dataset, num_workers=16, resumable_with_seed: int = None):
-        
-        from f5_tts.model.dataset import CrossUtteranceDataset, cross_utterance_collate_fn
-        is_cross = isinstance(train_dataset, CrossUtteranceDataset)
-        _collate = cross_utterance_collate_fn if is_cross else collate_fn
-        
+        cross_utterance = isinstance(train_dataset, CrossUtteranceDataset)
+        _collate_fn = cross_utterance_collate_fn if cross_utterance else collate_fn
+
         if self.log_samples:
             from f5_tts.infer.utils_infer import cfg_strength, load_vocoder, nfe_step, sway_sampling_coef
 
@@ -358,7 +348,7 @@ class Trainer:
         if self.batch_size_type == "sample":
             train_dataloader = DataLoader(
                 train_dataset,
-                collate_fn=_collate,
+                collate_fn=_collate_fn,
                 num_workers=num_workers,
                 pin_memory=True,
                 persistent_workers=True,
@@ -378,7 +368,7 @@ class Trainer:
             )
             train_dataloader = DataLoader(
                 train_dataset,
-                collate_fn=_collate,
+                collate_fn=_collate_fn,
                 num_workers=num_workers,
                 pin_memory=True,
                 persistent_workers=True,
@@ -438,33 +428,30 @@ class Trainer:
 
             for batch in current_dataloader:
                 with self.accelerator.accumulate(self.model):
+                    text_inputs = batch["text"]
+                    mel_spec = batch["mel"].permute(0, 2, 1)
+                    mel_lengths = batch["mel_lengths"]
 
                     # TODO. add duration predictor training
                     if self.duration_predictor is not None and self.accelerator.is_local_main_process:
                         dur_loss = self.duration_predictor(mel_spec, lens=batch.get("durations"))
                         self.accelerator.log({"duration loss": dur_loss.item()}, step=global_update)
 
-                    if is_cross:
-                        full_mel = batch["mel"].permute(0, 2, 1)  # (B, T, D)
-                        full_lens = batch["mel_lengths"]
-                        ref_lens = batch["ref_mel_lengths"]
-                        
-                        loss, cond, pred = self.model(
-                            full_mel,
-                            text=batch["tgt_text"],
-                            lens=full_lens,
+                    if cross_utterance:  # RTFree-F5: mel = [reference ; target], text = target transcript
+                        rtfree_kwargs = dict(
                             ref_audio=batch["ref_audio"],
-                            ref_lens=ref_lens,                       # tensor, not scalar!
-                            ref_audio_lens=batch["ref_audio_lens"],   # NEW
-                            noise_scheduler=self.noise_scheduler,
+                            ref_audio_lens=batch["ref_audio_lengths"],
+                            ref_lens=batch["ref_mel_lengths"],
                         )
                     else:
-                        loss, cond, pred = self.model(
-                            batch["mel"].permute(0, 2, 1),
-                            text=batch["text"],
-                            lens=batch["mel_lengths"],
-                            noise_scheduler=self.noise_scheduler
-                        )
+                        rtfree_kwargs = dict()
+                    loss, cond, pred = self.model(
+                        mel_spec,
+                        text=text_inputs,
+                        lens=mel_lengths,
+                        noise_scheduler=self.noise_scheduler,
+                        **rtfree_kwargs,
+                    )
                     self.accelerator.backward(loss)
 
                     if self.max_grad_norm > 0 and self.accelerator.sync_gradients:
@@ -497,18 +484,30 @@ class Trainer:
                     self.save_checkpoint(global_update)
 
                     if self.log_samples and self.accelerator.is_local_main_process:
-                        ref_audio_len = mel_lengths[0]
-                        infer_text = [
-                            text_inputs[0] + ([" "] if isinstance(text_inputs[0], list) else " ") + text_inputs[0]
-                        ]
+                        if cross_utterance:
+                            ref_audio_len = batch["ref_mel_lengths"][0]
+                            infer_text = [text_inputs[0]]
+                            duration = mel_lengths[0]
+                            sample_kwargs = dict(
+                                ref_audio=batch["ref_audio"][:1, : batch["ref_audio_lengths"][0]],
+                                ref_audio_lens=batch["ref_audio_lengths"][:1],
+                            )
+                        else:
+                            ref_audio_len = mel_lengths[0]
+                            infer_text = [
+                                text_inputs[0] + ([" "] if isinstance(text_inputs[0], list) else " ") + text_inputs[0]
+                            ]
+                            duration = ref_audio_len * 2
+                            sample_kwargs = dict()
                         with torch.inference_mode():
                             generated, _ = self.accelerator.unwrap_model(self.model).sample(
                                 cond=mel_spec[0][:ref_audio_len].unsqueeze(0),
                                 text=infer_text,
-                                duration=ref_audio_len * 2,
+                                duration=duration,
                                 steps=nfe_step,
                                 cfg_strength=cfg_strength,
                                 sway_sampling_coef=sway_sampling_coef,
+                                **sample_kwargs,
                             )
                             generated = generated.to(torch.float32)
                             gen_mel_spec = generated[:, ref_audio_len:, :].permute(0, 2, 1).to(self.accelerator.device)

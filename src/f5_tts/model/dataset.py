@@ -248,11 +248,11 @@ def load_dataset(
     mel_spec_module: nn.Module | None = None,
     mel_spec_kwargs: dict = dict(),
     cross_utterance: bool = False,
-    speaker_id_key: str = "speaker_id",
 ) -> CustomDataset | HFDataset:
     """
     dataset_type    - "CustomDataset" if you want to use tokenizer name and default data path to load for train_dataset
                     - "CustomDatasetPath" if you just want to pass the full path to a preprocessed dataset without relying on tokenizer
+    cross_utterance - RTFree-F5: return a CrossUtteranceDataset (same-speaker reference/target pairs), CustomDataset only
     """
 
     print("Loading dataset ...")
@@ -271,15 +271,15 @@ def load_dataset(
         with open(f"{rel_data_path}/duration.json", "r", encoding="utf-8") as f:
             data_dict = json.load(f)
         durations = data_dict["duration"]
-        if cross_utterance: 
+        if cross_utterance:
+            assert not preprocessed_mel, "CrossUtteranceDataset needs raw audio for the speech encoder"
             train_dataset = CrossUtteranceDataset(
-                train_dataset,  # the raw arrow dataset
+                train_dataset,
                 durations=durations,
                 mel_spec_module=mel_spec_module,
-                speaker_id_key=speaker_id_key,
                 **mel_spec_kwargs,
             )
-        else: 
+        else:
             train_dataset = CustomDataset(
                 train_dataset,
                 durations=durations,
@@ -335,21 +335,28 @@ def collate_fn(batch):
 
     return dict(
         mel=mel_specs,
-        mel_lengths=mel_lengths,  # records for padding mask
+        mel_lengths=mel_lengths,
         text=text,
         text_lengths=text_lengths,
     )
 
 
+# RTFree-F5: cross-utterance training data
+
+
 class CrossUtteranceDataset(Dataset):
     """
-    Samples pairs of utterances from the same speaker.
-    Returns: ref_audio (for speech encoder), tgt_mel, tgt_text (for flow matching)
-    Text is returned as raw string - tokenization happens in CFM.forward() via vocab_char_map.
+    Same-speaker (reference, target) pairs for RTFree-F5 training.
+
+    For each utterance (the reference), a different utterance of the same speaker is sampled as the target.
+    The reference waveform feeds the speech encoder and its mel is the unmasked acoustic context;
+    the target mel is the flow-matching target and the target transcript is the text condition.
+    Rows of `custom_dataset` need a `speaker_id` field (see train/datasets/prepare_libritts.py).
     """
+
     def __init__(
         self,
-        custom_dataset,
+        custom_dataset: Dataset,
         durations=None,
         target_sample_rate=24_000,
         hop_length=256,
@@ -357,105 +364,98 @@ class CrossUtteranceDataset(Dataset):
         n_fft=1024,
         win_length=1024,
         mel_spec_type="vocos",
-        mel_spec_module=None,
-        speaker_id_key="speaker_id",
+        mel_spec_module: nn.Module | None = None,
+        min_duration=0.3,
+        max_duration=30,
     ):
         self.data = custom_dataset
-        self.durations = durations
         self.target_sample_rate = target_sample_rate
         self.hop_length = hop_length
-        
+
         self.mel_spectrogram = default(
             mel_spec_module,
-            MelSpec(n_fft=n_fft, hop_length=hop_length, win_length=win_length,
-                    n_mel_channels=n_mel_channels, target_sample_rate=target_sample_rate,
-                    mel_spec_type=mel_spec_type),
+            MelSpec(
+                n_fft=n_fft,
+                hop_length=hop_length,
+                win_length=win_length,
+                n_mel_channels=n_mel_channels,
+                target_sample_rate=target_sample_rate,
+                mel_spec_type=mel_spec_type,
+            ),
         )
-        
-        # Build speaker -> indices mapping
-        from collections import defaultdict
-        self.spk2idx = defaultdict(list)
-        for i in range(len(self.data)):
-            row = self.data[i]
-            spk = row.get(speaker_id_key, row.get("speaker", "unknown"))
-            dur = durations[i] if durations else row.get("duration", 10)
-            if 0.3 <= dur <= 30:
-                self.spk2idx[spk].append(i)
-        
-        # Only keep speakers with 2+ utterances (needed for cross-utterance pairing)
-        self.valid_idx = [i for spk, idxs in self.spk2idx.items() if len(idxs) >= 2 for i in idxs]
-        print(f"CrossUtteranceDataset: {len(self.valid_idx)} samples, "
-              f"{sum(1 for idxs in self.spk2idx.values() if len(idxs)>=2)} speakers")
-    
+
+        if durations is None:
+            durations = self.data["duration"]
+        assert "speaker_id" in self.data.column_names, "CrossUtteranceDataset needs a `speaker_id` column"
+        speaker_ids = self.data["speaker_id"]
+
+        # speaker -> indices of usable utterances; keep speakers with at least two of them
+        spk2idx = {}
+        for i, (spk, dur) in enumerate(zip(speaker_ids, durations)):
+            if min_duration <= dur <= max_duration:
+                spk2idx.setdefault(spk, []).append(i)
+        self.spk2idx = {spk: idx for spk, idx in spk2idx.items() if len(idx) >= 2}
+        self.indices = [i for idx in self.spk2idx.values() for i in idx]
+        self.speaker_of = {i: spk for spk, idx in self.spk2idx.items() for i in idx}
+        self.durations = durations
+        print(f"CrossUtteranceDataset: {len(self.indices)} utterances from {len(self.spk2idx)} speakers")
+
     def get_frame_len(self, index):
-        i = self.valid_idx[index]
-        dur = self.durations[i] if self.durations else self.data[i].get("duration", 10)
-        return dur * self.target_sample_rate / self.hop_length
-    
+        # frame budget of the dynamic batch sampler counts reference frames only; the target adds about as much again
+        return self.durations[self.indices[index]] * self.target_sample_rate / self.hop_length
+
     def __len__(self):
-        return len(self.valid_idx)
-    
+        return len(self.indices)
+
+    def _load_audio(self, path):
+        audio, sr = torchaudio.load(path)
+        if audio.shape[0] > 1:
+            audio = audio.mean(0, keepdim=True)
+        if sr != self.target_sample_rate:
+            audio = torchaudio.transforms.Resample(sr, self.target_sample_rate)(audio)
+        return audio
+
     def __getitem__(self, index):
-        import random
-        i = self.valid_idx[index]
-        row = self.data[i]
-        spk = row.get("speaker_id", row.get("speaker", "unknown"))
-        
-        # Sample different utterance from same speaker
-        candidates = [x for x in self.spk2idx[spk] if x != i]
-        j = random.choice(candidates) if candidates else i
-        partner = self.data[j]
-        
-        # Load reference audio (for speech encoder input)
-        ref_audio, sr = torchaudio.load(row["audio_path"])
-        if ref_audio.shape[0] > 1:
-            ref_audio = ref_audio.mean(0, keepdim=True)
-        if sr != self.target_sample_rate:
-            ref_audio = torchaudio.transforms.Resample(sr, self.target_sample_rate)(ref_audio)
-        
-        # Load target audio -> mel (for flow matching target)
-        tgt_audio, sr = torchaudio.load(partner["audio_path"])
-        if tgt_audio.shape[0] > 1:
-            tgt_audio = tgt_audio.mean(0, keepdim=True)
-        if sr != self.target_sample_rate:
-            tgt_audio = torchaudio.transforms.Resample(sr, self.target_sample_rate)(tgt_audio)
-        
-        ref_mel = self.mel_spectrogram(ref_audio).squeeze(0)
-        tgt_mel = self.mel_spectrogram(tgt_audio).squeeze(0)
-        
+        i = self.indices[index]
+        candidates = [j for j in self.spk2idx[self.speaker_of[i]] if j != i]
+        j = candidates[torch.randint(len(candidates), ()).item()]
+
+        ref_audio = self._load_audio(self.data[i]["audio_path"])
+        tgt_audio = self._load_audio(self.data[j]["audio_path"])
+
         return {
-            "ref_audio": ref_audio.squeeze(0),  # (samples,) for speech encoder
-            "ref_mel": ref_mel,                  # (n_mel, frames) for ref_len calculation
-            "tgt_mel": tgt_mel,                  # (n_mel, frames) for flow matching
-            "tgt_text": partner["text"],         # raw string, tokenized in CFM.forward()
+            "ref_audio": ref_audio.squeeze(0),  # (nw,) reference waveform for the speech encoder
+            "ref_mel": self.mel_spectrogram(ref_audio).squeeze(0),  # (d, n) unmasked acoustic context
+            "tgt_mel": self.mel_spectrogram(tgt_audio).squeeze(0),  # (d, n) flow-matching target
+            "text": self.data[j]["text"],  # target transcript
         }
-        
+
+
 def cross_utterance_collate_fn(batch):
-    # 1. Concatenate ref and tgt per sample
-    full_mels = [torch.cat([b["ref_mel"], b["tgt_mel"]], dim=1) for b in batch]
-    
-    # 2. Get lengths
-    ref_mel_lengths = torch.LongTensor([b["ref_mel"].shape[-1] for b in batch])
-    tgt_mel_lengths = torch.LongTensor([b["tgt_mel"].shape[-1] for b in batch])
-    full_mel_lengths = ref_mel_lengths + tgt_mel_lengths
-    
-    # 3. Pad the concatenated sequences
-    max_full_len = full_mel_lengths.amax()
-    padded_full_mels = []
-    for mel in full_mels:
-        padded_full_mels.append(F.pad(mel, (0, max_full_len - mel.shape[-1]), value=0))
-    full_mels = torch.stack(padded_full_mels)
-    
-    # 4. Handle ref audio — track original lengths before padding
-    ref_audio_lens = torch.LongTensor([b["ref_audio"].shape[-1] for b in batch])
-    max_ref_audio = ref_audio_lens.amax().item()
-    ref_audios = torch.stack([F.pad(b["ref_audio"], (0, max_ref_audio - b["ref_audio"].shape[-1])) for b in batch])
-    
-    return {
-        "ref_audio": ref_audios,
-        "ref_audio_lens": ref_audio_lens,      # NEW
-        "mel": full_mels,
-        "mel_lengths": full_mel_lengths,
-        "ref_mel_lengths": ref_mel_lengths,
-        "tgt_text": [b["tgt_text"] for b in batch],
-    }
+    ref_mel_lengths = torch.LongTensor([item["ref_mel"].shape[-1] for item in batch])
+    mel_lengths = torch.LongTensor([item["ref_mel"].shape[-1] + item["tgt_mel"].shape[-1] for item in batch])
+    max_mel_length = mel_lengths.amax()
+    mel_specs = torch.stack(
+        [
+            F.pad(torch.cat([item["ref_mel"], item["tgt_mel"]], dim=-1), (0, max_mel_length - length), value=0)
+            for item, length in zip(batch, mel_lengths)
+        ]
+    )
+
+    ref_audio_lengths = torch.LongTensor([item["ref_audio"].shape[-1] for item in batch])
+    max_ref_audio_length = ref_audio_lengths.amax()
+    ref_audio = torch.stack(
+        [F.pad(item["ref_audio"], (0, max_ref_audio_length - length)) for item, length in zip(batch, ref_audio_lengths)]
+    )
+
+    text = [item["text"] for item in batch]
+
+    return dict(
+        mel=mel_specs,  # [reference ; target] mels, zero padded
+        mel_lengths=mel_lengths,
+        ref_mel_lengths=ref_mel_lengths,
+        ref_audio=ref_audio,
+        ref_audio_lengths=ref_audio_lengths,
+        text=text,
+        text_lengths=torch.LongTensor([len(item) for item in text]),
+    )

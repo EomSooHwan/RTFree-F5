@@ -29,7 +29,7 @@ from transformers import pipeline
 from vocos import Vocos
 
 from f5_tts.model import CFM
-from f5_tts.model.utils import convert_char_to_pinyin, get_tokenizer
+from f5_tts.model.utils import convert_char_to_pinyin, filter_state_dict, get_tokenizer
 
 
 _ref_audio_cache = {}
@@ -63,6 +63,9 @@ cfg_strength = 2.0
 sway_sampling_coef = -1.0
 speed = 1.0
 fix_duration = None
+rtfree_ref_text_rate = (
+    15  # RTFree-F5 without --ref_text: assumed reference speaking rate (utf-8 bytes / s) for duration
+)
 
 # -----------------------------------------
 
@@ -185,6 +188,19 @@ def transcribe(ref_audio, language=None):
 # load model checkpoint for inference
 
 
+def _load_state_dict(model, state_dict):
+    # RTFree-F5 checkpoints omit the frozen speech encoder (reloaded from Hugging Face); a vanilla F5-TTS checkpoint
+    # loaded into an RTFree-F5 model leaves the projector randomly initialized (stage-1 starting point).
+    loadable, missing, unexpected = filter_state_dict(model, state_dict)
+    unexpected = [k for k in unexpected if not k.startswith("speech_encoder.")]
+    missing = [k for k in missing if not k.startswith("speech_encoder.")]
+    if unexpected or any(not k.startswith("projector.") for k in missing):
+        raise RuntimeError(f"checkpoint does not match the model. missing: {missing[:5]}, unexpected: {unexpected[:5]}")
+    if missing:
+        print(f"[load_checkpoint] {len(missing)} projector tensors not in checkpoint, randomly initialized")
+    model.load_state_dict(loadable, strict=False)
+
+
 def load_checkpoint(model, ckpt_path, device: str, dtype=None, use_ema=True):
     if dtype is None:
         dtype = (
@@ -218,55 +234,11 @@ def load_checkpoint(model, ckpt_path, device: str, dtype=None, use_ema=True):
             if key in checkpoint["model_state_dict"]:
                 del checkpoint["model_state_dict"][key]
 
-        # === PARTIAL LOADING (for RefFree compatibility) ===
-        model_state = model.state_dict()
-        ckpt_state = checkpoint["model_state_dict"]
-        
-        # Filter: only load keys that exist in model AND have matching shapes
-        filtered_state = {}
-        missing_keys = []
-        shape_mismatch_keys = []
-        
-        for k, v in ckpt_state.items():
-            if k in model_state:
-                if model_state[k].shape == v.shape:
-                    filtered_state[k] = v
-                else:
-                    shape_mismatch_keys.append(k)
-            # else: key in ckpt but not in model (ignore)
-        
-        # Find keys in model but not in ckpt (will use initialized values)
-        for k in model_state.keys():
-            if k not in ckpt_state:
-                missing_keys.append(k)
-        
-        # Log partial loading info
-        if missing_keys:
-            print(f"[load_checkpoint] Keys in model but not in checkpoint (using initialized): {len(missing_keys)}")
-            for k in missing_keys[:10]:  # Show first 10
-                print(f"  - {k}")
-            if len(missing_keys) > 10:
-                print(f"  ... and {len(missing_keys) - 10} more")
-        
-        if shape_mismatch_keys:
-            print(f"[load_checkpoint] Shape mismatch keys (using initialized): {shape_mismatch_keys}")
-        
-        model.load_state_dict(filtered_state, strict=False)
-        print(f"[load_checkpoint] Loaded {len(filtered_state)}/{len(model_state)} parameters")
-        # === END PARTIAL LOADING ===
-        
+        _load_state_dict(model, checkpoint["model_state_dict"])
     else:
         if ckpt_type == "safetensors":
             checkpoint = {"model_state_dict": checkpoint}
-        
-        # === PARTIAL LOADING for non-EMA too ===
-        model_state = model.state_dict()
-        ckpt_state = checkpoint["model_state_dict"]
-        filtered_state = {k: v for k, v in ckpt_state.items() 
-                         if k in model_state and model_state[k].shape == v.shape}
-        model.load_state_dict(filtered_state, strict=False)
-        print(f"[load_checkpoint] Loaded {len(filtered_state)}/{len(model_state)} parameters")
-        # === END PARTIAL LOADING ===
+        _load_state_dict(model, checkpoint["model_state_dict"])
 
     del checkpoint
     torch.cuda.empty_cache()
@@ -286,7 +258,8 @@ def load_model(
     ode_method=ode_method,
     use_ema=True,
     device=device,
-    speech_encoder_name=None,
+    speech_encoder_name=None,  # RTFree-F5: e.g. "microsoft/wavlm-large"
+    projector_hidden_dim=None,  # RTFree-F5
 ):
     if vocab_file == "":
         vocab_file = str(files("f5_tts").joinpath("infer/examples/vocab.txt"))
@@ -312,6 +285,7 @@ def load_model(
         ),
         vocab_char_map=vocab_char_map,
         speech_encoder_name=speech_encoder_name,
+        projector_hidden_dim=projector_hidden_dim,
     ).to(device)
 
     dtype = torch.float32 if mel_spec_type == "bigvgan" else None
@@ -339,7 +313,7 @@ def remove_silence_edges(audio, silence_threshold=-42):
 # preprocess reference audio and text
 
 
-def preprocess_ref_audio_text(ref_audio_orig, ref_text, show_info=print):
+def preprocess_ref_audio_text(ref_audio_orig, ref_text, show_info=print, transcribe_if_missing=True):
     show_info("Converting audio...")
 
     # Compute a hash of the reference audio file
@@ -396,6 +370,10 @@ def preprocess_ref_audio_text(ref_audio_orig, ref_text, show_info=print):
         # Cache the processed reference audio
         _ref_audio_cache[audio_hash] = ref_audio
 
+    if not ref_text.strip() and not transcribe_if_missing:  # RTFree-F5 needs no reference transcript
+        show_info("No reference text, reference-transcript-free inference.")
+        return ref_audio, ""
+
     if not ref_text.strip():
         global _ref_text_cache
         if audio_hash in _ref_text_cache:
@@ -442,11 +420,12 @@ def infer_process(
     speed=speed,
     fix_duration=fix_duration,
     device=device,
-    reffree=False,
+    rtfree=False,  # RTFree-F5: condition on reference speech features; ref_text (if any) only guides the duration
 ):
     # Split the input text into batches
     audio, sr = torchaudio.load(ref_audio)
-    max_chars = int(len(ref_text.encode("utf-8")) / (audio.shape[-1] / sr) * (22 - audio.shape[-1] / sr) * speed)
+    ref_text_len = _ref_text_len(ref_text, audio.shape[-1] / sr)
+    max_chars = int(ref_text_len / (audio.shape[-1] / sr) * (22 - audio.shape[-1] / sr) * speed)
     gen_text_batches = chunk_text(gen_text, max_chars=max_chars)
     for i, gen_text in enumerate(gen_text_batches):
         print(f"gen_text {i}", gen_text)
@@ -470,9 +449,14 @@ def infer_process(
             speed=speed,
             fix_duration=fix_duration,
             device=device,
-            reffree=reffree,
+            rtfree=rtfree,
         )
     )
+
+
+def _ref_text_len(ref_text, ref_audio_secs):
+    # utf-8 length of the reference transcript, or an estimate from the reference duration if there is none (RTFree-F5)
+    return len(ref_text.encode("utf-8")) if ref_text.strip() else max(1, int(rtfree_ref_text_rate * ref_audio_secs))
 
 
 # infer batches
@@ -496,7 +480,7 @@ def infer_batch_process(
     device=None,
     streaming=False,
     chunk_size=2048,
-    reffree=False,
+    rtfree=False,
 ):
     audio, sr = ref_audio
     if audio.shape[0] > 1:
@@ -513,7 +497,7 @@ def infer_batch_process(
     generated_waves = []
     spectrograms = []
 
-    if len(ref_text[-1].encode("utf-8")) == 1:
+    if ref_text and len(ref_text[-1].encode("utf-8")) == 1:
         ref_text = ref_text + " "
 
     def process_batch(gen_text):
@@ -521,8 +505,8 @@ def infer_batch_process(
         if len(gen_text.encode("utf-8")) < 10:
             local_speed = 0.3
 
-        # Prepare the text
-        text_list = [ref_text + gen_text]
+        # Prepare the text (RTFree-F5: target text only, the reference is conditioned through its speech features)
+        text_list = [gen_text] if rtfree else [ref_text + gen_text]
         final_text_list = convert_char_to_pinyin(text_list)
 
         ref_audio_len = audio.shape[-1] // hop_length
@@ -530,18 +514,9 @@ def infer_batch_process(
             duration = int(fix_duration * target_sample_rate / hop_length)
         else:
             # Calculate duration
-            ref_text_len = len(ref_text.encode("utf-8"))
+            ref_text_len = _ref_text_len(ref_text, audio.shape[-1] / target_sample_rate)
             gen_text_len = len(gen_text.encode("utf-8"))
             duration = ref_audio_len + int(ref_audio_len / ref_text_len * gen_text_len / local_speed)
-            
-        ref_audio_tensor = None
-        if reffree:
-            ref_audio_tensor = audio.clone()
-            if ref_audio_tensor.shape[0] > 1:
-                ref_audio_tensor = ref_audio_tensor.mean(0, keepdim=True)
-            if sr != target_sample_rate:
-                ref_audio_tensor = torchaudio.functional.resample(ref_audio_tensor, sr, target_sample_rate)
-            ref_audio_tensor = ref_audio_tensor.to(device)
 
         # inference
         with torch.inference_mode():
@@ -552,7 +527,7 @@ def infer_batch_process(
                 steps=nfe_step,
                 cfg_strength=cfg_strength,
                 sway_sampling_coef=sway_sampling_coef,
-                ref_audio=ref_audio_tensor
+                ref_audio=audio if rtfree else None,
             )
             del _
 
